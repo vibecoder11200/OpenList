@@ -1,0 +1,1 @@
+import{$i as e,fa as t,ha as n,ia as r,rr as i}from"./store-CgFD1BzO.js";var a=a=>{let[o,s]=t(!1);return r(e,{get when(){return!o()},get fallback(){return a.fallbackErr},get children(){return r(i,n(a,{onError:()=>{s(!0)}}))}})};export{a as t};
