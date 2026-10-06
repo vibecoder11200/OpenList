@@ -1,0 +1,25 @@
+#!/bin/sh
+exec 2>&1
+CONFIG=/opt/openlist/data/service/transmission/config
+DOWNLOAD_DIR=/opt/openlist/data/temp
+mkdir -p "$CONFIG" "$DOWNLOAD_DIR"
+if [ ! -f "$CONFIG/settings.json" ]; then
+  # First boot: let the daemon generate a full settings.json, stop it, then
+  # patch the RPC options OpenList needs.
+  transmission-daemon --config-dir "$CONFIG" --download-dir "$DOWNLOAD_DIR" 2>/dev/null
+  i=0
+  while [ "$i" -lt 60 ] && [ ! -f "$CONFIG/settings.json" ]; do
+    sleep 0.5
+    i=$((i + 1))
+  done
+  sleep 1
+  killall transmission-daemon 2>/dev/null
+  while killall -0 transmission-daemon 2>/dev/null; do
+    sleep 0.2
+  done
+  sed -i 's/"rpc-enabled": false/"rpc-enabled": true/' "$CONFIG/settings.json"
+  sed -i 's/"rpc-bind-address": "0.0.0.0"/"rpc-bind-address": "127.0.0.1"/' "$CONFIG/settings.json"
+  sed -i 's/"download-dir": "[^"]*"/"download-dir": "'"$DOWNLOAD_DIR"'"/' "$CONFIG/settings.json"
+  sed -i 's/"incomplete-dir-enabled": true/"incomplete-dir-enabled": false/' "$CONFIG/settings.json"
+fi
+exec transmission-daemon --foreground --config-dir "$CONFIG" --download-dir "$DOWNLOAD_DIR"

@@ -20,20 +20,26 @@ EOF
     fi
   fi
 
-  # Define the target directory path for aria2 service
-  ARIA2_DIR="/opt/service/start/aria2"
-  if [ "$RUN_ARIA2" = "true" ]; then
-    # If aria2 should run and target directory doesn't exist, copy it
-    if [ ! -d "$ARIA2_DIR" ]; then
-      mkdir -p "$ARIA2_DIR"
-      cp -r /opt/service/stop/aria2/* "$ARIA2_DIR" 2>/dev/null
+  # Enable the bundled offline-download services (aria2, qBittorrent,
+  # Transmission) as runit services. Each service seeds its persistent
+  # config under /opt/openlist/data/service/<name> on first start.
+  enable_service() {
+    name="$1"
+    want="$2"
+    if [ "$want" = "true" ]; then
+      mkdir -p "/opt/service/start/$name"
+      cp -r "/opt/mod/service/$name/." "/opt/service/start/$name/"
+    else
+      rm -rf "/opt/service/start/$name"
     fi
+  }
+  enable_service aria2 "${RUN_ARIA2:-true}"
+  enable_service qbittorrent "${RUN_QBIT:-true}"
+  enable_service transmission "${RUN_TRANS:-true}"
+
+  if [ -n "$(ls /opt/service/start 2>/dev/null)" ]; then
     runsvdir /opt/service/start &
-  else
-    # If aria2 should NOT run and target directory exists, remove it
-    if [ -d "$ARIA2_DIR" ]; then
-      rm -rf "$ARIA2_DIR"
-    fi
   fi
+
   exec ./openlist server --no-prefix
 fi
