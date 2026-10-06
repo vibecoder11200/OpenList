@@ -1,0 +1,17 @@
+#!/bin/sh
+exec 2>&1
+CONF_DIR=/opt/openlist/data/service/aria2
+mkdir -p "$CONF_DIR" /opt/openlist/data/temp
+if [ ! -f "$CONF_DIR/aria2.conf" ]; then
+  cp /opt/mod/service/aria2/aria2.conf "$CONF_DIR/aria2.conf"
+fi
+SESSION="$CONF_DIR/aria2.session"
+[ -f "$SESSION" ] || touch "$SESSION"
+exec aria2c \
+  --enable-rpc \
+  --rpc-listen-all=false \
+  --rpc-allow-origin-all \
+  --conf-path="$CONF_DIR/aria2.conf" \
+  --input-file="$SESSION" \
+  --save-session="$SESSION" \
+  --dir=/opt/openlist/data/temp
