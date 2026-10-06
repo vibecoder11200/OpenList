@@ -120,6 +120,10 @@ func UpdateIndex() {
 		"https://res.oplist.org/logo/logo.png": logo,
 		"Loading...":                           title,
 		"main_color: undefined":                fmt.Sprintf("main_color: '%s'", mainColor),
+		// mod: branding metas follow the site title instead of hardcoding
+		// the upstream product name (matches the built dist tag form).
+		`<meta name="generator" content="OpenList" >`:                  fmt.Sprintf(`<meta name="generator" content=%q >`, title),
+		`<meta name="apple-mobile-web-app-title" content="OpenList" >`: fmt.Sprintf(`<meta name="apple-mobile-web-app-title" content=%q >`, title),
 	}
 	conf.ManageHtml = replaceStrings(conf.RawIndexHtml, replaceMap1)
 	utils.Log.Debug("Applying replacements for manage pages...")
