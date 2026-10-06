@@ -126,6 +126,7 @@ func InitialSettings() []model.SettingItem {
 		{Key: "show_disk_usage_in_plain_text", Value: "false", Type: conf.TypeBool, Group: model.STYLE, Flag: model.PUBLIC},
 		{Key: "powered_by_visible", Value: "true", Type: conf.TypeBool, Group: model.STYLE, Flag: model.PUBLIC},
 		{Key: "powered_by_text", Value: "Powered by OpenList", Type: conf.TypeString, Group: model.STYLE, Flag: model.PUBLIC},
+		{Key: "powered_by_link", Value: "", Type: conf.TypeString, Group: model.STYLE, Flag: model.PUBLIC, Help: "empty renders plain text"},
 		// preview settings
 		{Key: conf.TextTypes, Value: "txt,htm,html,xml,java,properties,sql,js,md,json,conf,ini,vue,php,py,bat,gitignore,yml,go,sh,c,cpp,h,hpp,tsx,vtt,srt,ass,rs,lrc,strm", Type: conf.TypeText, Group: model.PREVIEW, Flag: model.PRIVATE},
 		{Key: conf.AudioTypes, Value: "mp3,flac,ogg,m4a,wav,opus,wma", Type: conf.TypeText, Group: model.PREVIEW, Flag: model.PRIVATE},
