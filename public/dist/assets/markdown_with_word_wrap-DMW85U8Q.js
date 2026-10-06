@@ -1,0 +1,1 @@
+import{E as e,H as t,dn as n,ia as r}from"./store-rZBpf520.js";import{Z as i,on as a}from"./index-CsSVCfEi.js";var o=()=>{let[o]=t();return r(a,{get loading(){return o.loading},get children(){return r(i,{class:`word-wrap`,get children(){return o()?.content},get ext(){return n(e.obj.name)},toc:!0})}})};export{o as default};
