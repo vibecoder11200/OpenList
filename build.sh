@@ -637,7 +637,11 @@ for arg in "$@"; do
 done
 
 if [ "$buildType" = "dev" ]; then
-  FetchWebRolling
+  if [ -f public/dist/index.html ]; then
+    echo "using committed frontend dist in public/dist, skip fetching"
+  else
+    FetchWebRolling
+  fi
   if [ "$dockerType" = "docker" ]; then
     BuildDocker
   elif [ "$dockerType" = "docker-multiplatform" ]; then
@@ -648,7 +652,9 @@ if [ "$buildType" = "dev" ]; then
     BuildDev
   fi
 elif [ "$buildType" = "release" -o "$buildType" = "beta" ]; then
-  if [ "$buildType" = "beta" ]; then
+  if [ -f public/dist/index.html ]; then
+    echo "using committed frontend dist in public/dist, skip fetching"
+  elif [ "$buildType" = "beta" ]; then
     FetchWebRolling
   else
     FetchWebRelease
