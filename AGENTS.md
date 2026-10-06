@@ -58,3 +58,38 @@ Examples:
 If you are not one of the listed assistants, do not add a `Co-authored-by` trailer.
 
 Instead, ask the human collaborator to provide the exact `Co-authored-by` trailer to use. Do not invent, infer, or generate one yourself.
+
+## Mod Releases
+
+The `mods` branch (fork `vibecoder11200/OpenList`) is the maintained mod line that runs in
+production ("Drive Hub", OpenList container on the AnVPS host, deploy dir `/opt/openlist`).
+Frontend patches live in the fork `vibecoder11200/OpenList-Frontend` (branch `mods`) and are
+vendored as a build into `public/dist`; `build.sh` uses the committed dist when
+`public/dist/index.html` exists instead of fetching the official release asset.
+
+Version format: `v<upstream-base>-mod.<n>` (for example `v4.2.6-mod.1`).
+
+- Bump `<n>` by one for every production release of the mod. Do this proactively as part of
+  the release, without waiting to be asked.
+- Reset `<n>` to `1` when the mod is rebased onto a new upstream base version.
+- The first mod tag is `v4.2.6-mod.1` and is reserved for the next production release.
+
+The production build happens on the VPS in `/root/openlist-src-new`, a standalone git repo
+refreshed from a deploy tarball. `build.sh` derives the reported version from
+`git describe --abbrev=0 --tags`, so the tag must exist in that repo before building, or the
+site reports `v0.0.0`.
+
+Standard release process:
+
+1. Commit the changes on the `mods` branch and push to `vibecoder11200/OpenList`
+   (and to `vibecoder11200/OpenList-Frontend` when frontend sources changed).
+2. Create the deploy archive with LF endings preserved:
+   `git -c core.autocrlf=false -c core.eol=lf archive --format=tar.gz -o openlist-src-deploy.tar.gz HEAD`
+3. Copy it to the VPS, extract into `/root/openlist-src-new`, then `git add -A` and commit.
+4. Bump the version tag in that repo: `git tag v<base>-mod.<n+1>` (delete and re-create the
+   tag only when the release itself is being redone).
+5. Build: `docker build -t openlist-patched:latest .`, then deploy:
+   `cd /opt/openlist && docker compose up -d`.
+6. Verify: `docker exec openlist /opt/openlist/openlist version` reports the new tag, then
+   smoke-test the changed features. Keep the previous image tag
+   (`openlist-patched:backup-<date>`) for rollback.
