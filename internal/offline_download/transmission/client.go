@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -131,12 +130,7 @@ func (t *Transmission) Remove(task *tool.DownloadTask) error {
 	if err != nil {
 		return err
 	}
-	// Remove also runs as cancellation cleanup, when the task context is
-	// already canceled; use a detached context so the torrent is still
-	// removed from the daemon.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	err = t.client.TorrentRemove(ctx, transmissionrpc.TorrentRemovePayload{
+	err = t.client.TorrentRemove(task.Ctx(), transmissionrpc.TorrentRemovePayload{
 		IDs:             []int64{gid},
 		DeleteLocalData: false,
 	})
