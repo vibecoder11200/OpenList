@@ -6,4 +6,9 @@ export HOME="$HOME_DIR"
 if [ ! -f "$HOME/.config/qBittorrent/qBittorrent.conf" ]; then
   cp /opt/mod/service/qbittorrent/qBittorrent.conf "$HOME/.config/qBittorrent/qBittorrent.conf"
 fi
+# A container restart leaves a stale lock behind on the persistent volume,
+# which makes the next instance exit with "another instance is running".
+rm -f "$HOME/.config/qBittorrent/lockfile" \
+      "$HOME/.config/qBittorrent/ipc-socket" \
+      "$HOME/.config/qBittorrent/qBittorrent.lock"
 exec qbittorrent-nox --webui-port=8080
