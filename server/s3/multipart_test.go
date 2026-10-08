@@ -465,6 +465,60 @@ func TestMultipartCompleteRetryAfterFailure(t *testing.T) {
 	waitUploadGone(t, b, uploadID)
 }
 
+// TestMultipartHeadPendingDuringFinalize verifies that HEAD serves the
+// committed size while the finalization is still queued/running, so clients
+// verifying immediately after CompleteMultipartUpload (rclone) do not see a
+// missing or zero-sized object.
+func TestMultipartHeadPendingDuringFinalize(t *testing.T) {
+	ctx := context.Background()
+	b, _, _ := setupMultipartBackend(t)
+
+	uploadID := mustCreateUpload(t, b, "mp", "pending.txt", nil)
+	e1 := mustUploadPart(t, b, "mp", "pending.txt", uploadID, 1, "abc")
+	e2 := mustUploadPart(t, b, "mp", "pending.txt", uploadID, 2, "defgh")
+
+	// Missing before completion.
+	if _, err := b.HeadObject(ctx, "mp", "pending.txt"); s3ErrorCode(err) != gofakes3.ErrNoSuchKey {
+		t.Fatalf("HEAD before complete error = %v, want NoSuchKey", s3ErrorCode(err))
+	}
+
+	// Block the finalize slots so completion is accepted but not executed.
+	finalizeSlots <- struct{}{}
+	finalizeSlots <- struct{}{}
+
+	parts := &gofakes3.CompleteMultipartUploadRequest{
+		Parts: []gofakes3.CompletedPart{
+			{PartNumber: 1, ETag: e1},
+			{PartNumber: 2, ETag: e2},
+		},
+	}
+	if _, _, err := b.CompleteMultipartUpload(ctx, "mp", "pending.txt", uploadID, parts); err != nil {
+		t.Fatalf("CompleteMultipartUpload: %+v", err)
+	}
+
+	// HEAD during the finalize window returns the committed size (3+5=8).
+	obj, err := b.HeadObject(ctx, "mp", "pending.txt")
+	if err != nil {
+		t.Fatalf("HEAD during finalize: %+v", err)
+	}
+	if obj.Size != 8 {
+		t.Fatalf("pending HEAD size = %d, want 8", obj.Size)
+	}
+
+	<-finalizeSlots
+	<-finalizeSlots
+	waitUploadGone(t, b, uploadID)
+
+	// After finalization the real object serves the same size.
+	obj, err = b.HeadObject(ctx, "mp", "pending.txt")
+	if err != nil {
+		t.Fatalf("HEAD after finalize: %+v", err)
+	}
+	if obj.Size != 8 {
+		t.Fatalf("final HEAD size = %d, want 8", obj.Size)
+	}
+}
+
 // TestMultipartReapSkipsCompleting verifies that the reaper never drops an
 // upload whose finalization is in progress, even if its lastActivity is stale.
 func TestMultipartReapSkipsCompleting(t *testing.T) {
