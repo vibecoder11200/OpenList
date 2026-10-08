@@ -69,10 +69,14 @@ vendored as a build into `public/dist`; `build.sh` uses the committed dist when
 
 Version format: `v<upstream-base>-mod.<n>` (for example `v4.2.6-mod.1`).
 
+- Derive `<n>` from the tag that is actually deployed: read the current tag first
+  (`git -C /root/openlist-src-new describe --abbrev=0 --tags`, e.g. `v4.2.6-mod.2`) and release
+  the next one (`v4.2.6-mod.3`). Never assume a fixed number.
 - Bump `<n>` by one for every production release of the mod. Do this proactively as part of
   the release, without waiting to be asked.
 - Reset `<n>` to `1` when the mod is rebased onto a new upstream base version.
-- The first mod tag is `v4.2.6-mod.1` and is reserved for the next production release.
+- Mod tags live in the VPS repo `/root/openlist-src-new` (the local repo usually carries only
+  upstream tags), so always read the tag there, not locally.
 
 The production build happens on the VPS in `/root/openlist-src-new`, a standalone git repo
 refreshed from a deploy tarball. `build.sh` derives the reported version from
