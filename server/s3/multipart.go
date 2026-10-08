@@ -53,6 +53,16 @@ type multipartState struct {
 	created      time.Time
 	lastActivity time.Time // updated under mu on create and each part upload
 
+	// Async completion bookkeeping (all guarded by mu):
+	// completing is true from the moment CompleteMultipartUpload is accepted
+	// until finalizeMultipart finishes. completedEtag caches the etag handed
+	// back to clients so repeated Complete calls are deduplicated. abortPending
+	// records an Abort that arrived while a finalization was in flight or
+	// queued behind the finalize semaphore.
+	completing    bool
+	completedEtag string
+	abortPending  bool
+
 	mu    sync.Mutex
 	parts map[int]*multipartPart
 }
@@ -66,11 +76,7 @@ func (b *s3Backend) CreateMultipartUpload(ctx context.Context, bucket, object st
 		return "", err
 	}
 
-	tempDir := conf.Conf.TempDir
-	if tempDir == "" {
-		tempDir = os.TempDir()
-	}
-	dir, err := os.MkdirTemp(tempDir, "s3-multipart-*")
+	dir, err := os.MkdirTemp(multipartTempDir(), "s3-multipart-*")
 	if err != nil {
 		return "", fmt.Errorf("create multipart upload dir: %w", err)
 	}
@@ -102,11 +108,10 @@ func (b *s3Backend) UploadPart(ctx context.Context, bucket, object string, uploa
 		return "", gofakes3.ErrInvalidPart
 	}
 
-	val, ok := b.uploads.Load(uploadID)
+	state, ok := b.loadUpload(uploadID)
 	if !ok {
 		return "", gofakes3.ErrNoSuchUpload
 	}
-	state := val.(*multipartState)
 
 	partPath := filepath.Join(state.dir, fmt.Sprintf("part-%05d", partNumber))
 	f, err := os.Create(partPath)
@@ -143,6 +148,12 @@ func (b *s3Backend) UploadPart(ctx context.Context, bucket, object string, uploa
 
 	now := time.Now()
 	state.mu.Lock()
+	if state.completing {
+		// The part set is frozen once a Complete has been accepted: a late
+		// UploadPart could truncate a part file the finalizer is reading.
+		state.mu.Unlock()
+		return "", gofakes3.ErrNoSuchUpload
+	}
 	if old := state.parts[partNumber]; old != nil && old.path != partPath {
 		_ = os.Remove(old.path)
 	}
@@ -160,17 +171,27 @@ func (b *s3Backend) UploadPart(ctx context.Context, bucket, object string, uploa
 	return etag, nil
 }
 
-// CompleteMultipartUpload assembles the uploaded parts in ascending part-number
-// order and streams the result into storage via the shared putStream path.
+// CompleteMultipartUpload validates the uploaded parts and accepts the
+// completion, returning the final etag immediately. The actual assembly —
+// concatenating the part files and streaming them into storage — happens in
+// finalizeMultipart on a background goroutine.
+//
+// Why async: putStream for a multi-GB object can run for minutes inside the
+// HTTP request. Reverse proxies in front of the gateway (notably Cloudflare
+// Tunnel) cut origin responses after ~100s and return 524, which makes the
+// client re-upload the entire object. Answering fast and finalizing detached
+// avoids that; the trade-off is eventual consistency — the object may not be
+// visible for the duration of the finalization.
 //
 // It implements gofakes3.MultipartBackend. Part ordering and etags are
-// validated against the parts actually received.
+// validated against the parts actually received. Repeated Complete calls
+// while a finalization is pending return the cached etag; after a failed
+// finalization the upload stays retryable (per the gofakes3 contract).
 func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucket, object string, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
-	val, ok := b.uploads.Load(uploadID)
+	state, ok := b.loadUpload(uploadID)
 	if !ok {
 		return "", "", gofakes3.ErrNoSuchUpload
 	}
-	state := val.(*multipartState)
 
 	if input == nil || len(input.Parts) == 0 {
 		return "", "", gofakes3.ErrorMessagef(gofakes3.ErrMalformedXML, "complete multipart upload has no parts")
@@ -186,8 +207,24 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucket, object 
 	// Validate every requested part exists with a matching etag, and collect
 	// them in the order requested by the client (which is sorted ascending).
 	state.mu.Lock()
+	if state.abortPending {
+		// An abort landed after a failed finalization reset this upload
+		// (see AbortMultipartUpload): nothing will finalize it, so clean it
+		// up instead of leaving it stuck until the reaper.
+		state.mu.Unlock()
+		b.removeUpload(uploadID)
+		return "", "", gofakes3.ErrNoSuchUpload
+	}
+	if state.completing {
+		// A finalization is already running (or queued) for this upload:
+		// deduplicate instead of streaming the parts twice.
+		etag := state.completedEtag
+		state.mu.Unlock()
+		return "", etag, nil
+	}
 	ordered := make([]*multipartPart, 0, len(input.Parts))
 	var concat []byte
+	var total int64
 	for _, p := range input.Parts {
 		stored := state.parts[p.PartNumber]
 		if stored == nil {
@@ -199,28 +236,69 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucket, object 
 			return "", "", gofakes3.ErrorMessagef(gofakes3.ErrInvalidPart, "unexpected part etag for number %d in complete request", p.PartNumber)
 		}
 		ordered = append(ordered, stored)
+		total += stored.size
 		// S3 multipart etag = hex(md5(concat(part_md5_digests)))-N
 		concat = append(concat, stored.md5Bytes()...)
 	}
-	// Hold the lock until the part files are opened so an abort racing with
-	// complete cannot delete them out from under us.
+	// From here the upload is committed to finalization: parts are frozen
+	// (UploadPart rejects completing uploads), the reaper skips it, and part
+	// files stay on disk until finalizeMultipart succeeds. The etag is
+	// published together with completing so a racing duplicate Complete can
+	// never observe an empty cached etag.
+	sum := md5.Sum(concat)
+	etag := fmt.Sprintf("%q", fmt.Sprintf("%s-%d", hex.EncodeToString(sum[:]), len(ordered)))
+	state.completing = true
+	state.completedEtag = etag
+	state.lastActivity = time.Now()
+	state.mu.Unlock()
+
+	go b.finalizeMultipart(uploadID, state, ordered, total)
+
+	log.Debugf("s3 multipart: accepted complete for %s -> %s/%s (%d bytes), finalizing in background", uploadID, bucket, object, total)
+	return "", etag, nil
+}
+
+// finalizeSlots bounds how many multipart finalizations stream into storage at
+// once. Each finalization re-reads every part file and can run for minutes on
+// multi-GB objects, so they are capped to keep disk I/O and driver load sane.
+var finalizeSlots = make(chan struct{}, 2)
+
+// finalizeMultipart assembles the part files in ascending part-number order
+// and streams the result into storage via the shared putStream path.
+//
+// It runs detached from the CompleteMultipartUpload request: that request's
+// context is canceled as soon as the response is written (or the connection
+// drops), so a background context is used deliberately — the transfer must
+// survive the client/proxy hanging up.
+func (b *s3Backend) finalizeMultipart(uploadID gofakes3.UploadID, state *multipartState, ordered []*multipartPart, total int64) {
+	finalizeSlots <- struct{}{}
+	defer func() { <-finalizeSlots }()
+
+	if state.isAbortPending() {
+		// Abort arrived while this finalization was queued behind the
+		// semaphore: drop the upload without touching storage.
+		b.removeUpload(uploadID)
+		log.Infof("s3 multipart: dropped upload %s (%s/%s), aborted before finalization", uploadID, state.bucket, state.object)
+		return
+	}
+
+	// The part set is frozen (completing), the reaper skips this upload and
+	// an abort while completing only records abortPending — nothing can
+	// delete the part files out from under us, so no lock is needed here.
 	readers := make([]io.Reader, 0, len(ordered))
 	closers := make([]io.Closer, 0, len(ordered))
-	var total int64
 	for _, part := range ordered {
 		f, err := os.Open(part.path)
 		if err != nil {
 			for _, c := range closers {
 				_ = c.Close()
 			}
-			state.mu.Unlock()
-			return "", "", fmt.Errorf("open part %s: %w", part.path, err)
+			b.finalizeFailed(uploadID, state, fmt.Errorf("open part %s: %w", part.path, err))
+			return
 		}
 		readers = append(readers, f)
 		closers = append(closers, f)
-		total += part.size
 	}
-	state.mu.Unlock()
 
 	combined := utils.NewReadCloser(io.MultiReader(readers...), func() error {
 		var firstErr error
@@ -232,31 +310,91 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucket, object 
 		return firstErr
 	})
 
-	defer combined.Close()
+	err := b.putStream(context.Background(), state.bucket, state.object, state.meta, combined, total)
+	_ = combined.Close()
 
-	err := b.putStream(ctx, bucket, object, state.meta, combined, total)
 	if err != nil {
-		// Leave the upload in place so the client may retry completion, per
-		// the gofakes3 MultipartBackend contract.
-		return "", "", err
+		b.finalizeFailed(uploadID, state, err)
+		return
 	}
 
-	// Success: drop bookkeeping and clean up part files.
 	b.removeUpload(uploadID)
+	log.Debugf("s3 multipart: completed upload %s -> %s/%s (%d bytes)", uploadID, state.bucket, state.object, total)
+}
 
-	sum := md5.Sum(concat)
-	etag := fmt.Sprintf("%q", fmt.Sprintf("%s-%d", hex.EncodeToString(sum[:]), len(ordered)))
-	log.Debugf("s3 multipart: completed upload %s -> %s/%s (%d bytes)", uploadID, bucket, object, total)
-	return "", etag, nil
+// finalizeFailed resets the completion state so the client may send another
+// CompleteMultipartUpload to retry. Parts and their files stay in place; only
+// a reaped upload would drop them. A pending abort wins over retryability and
+// removes the upload outright.
+func (b *s3Backend) finalizeFailed(uploadID gofakes3.UploadID, state *multipartState, err error) {
+	state.mu.Lock()
+	state.completing = false
+	state.completedEtag = ""
+	state.lastActivity = time.Now()
+	aborted := state.abortPending
+	state.mu.Unlock()
+
+	if aborted {
+		b.removeUpload(uploadID)
+		log.Infof("s3 multipart: dropped upload %s (%s/%s) after failed finalization + abort", uploadID, state.bucket, state.object)
+		return
+	}
+	log.Errorf("s3 multipart: finalize %s (%s/%s) failed, retryable via CompleteMultipartUpload: %v", uploadID, state.bucket, state.object, err)
+}
+
+func (s *multipartState) isAbortPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.abortPending
 }
 
 // AbortMultipartUpload discards an in-progress upload and its parts.
 //
 // It implements gofakes3.MultipartBackend and is idempotent: aborting an
-// unknown upload succeeds so retries do not fail.
+// unknown upload succeeds so retries do not fail. Aborting an upload whose
+// finalization already started records the request; the finalizer then drops
+// the upload (best-effort — a stream already in progress is allowed to run to
+// completion or failure first).
 func (b *s3Backend) AbortMultipartUpload(ctx context.Context, bucket, object string, uploadID gofakes3.UploadID) error {
+	state, ok := b.loadUpload(uploadID)
+	if !ok {
+		return nil
+	}
+
+	state.mu.Lock()
+	if state.completing {
+		// Finalization in progress (or queued): record the abort and let the
+		// finalizer drop the upload. Single critical section — reading
+		// completing and setting abortPending in two sections would race a
+		// finalizeFailed that resets completing in between, leaving an
+		// abortPending flag nothing will ever act on.
+		state.abortPending = true
+		state.mu.Unlock()
+		log.Infof("s3 multipart: abort requested for %s while finalizing, will drop after finalization", uploadID)
+		return nil
+	}
+	state.mu.Unlock()
+
 	b.removeUpload(uploadID)
 	return nil
+}
+
+// multipartTempDir returns the configured temp dir, falling back to the
+// system default when unset.
+func multipartTempDir() string {
+	if dir := conf.Conf.TempDir; dir != "" {
+		return dir
+	}
+	return os.TempDir()
+}
+
+// loadUpload returns the tracked state for uploadID, if any.
+func (b *s3Backend) loadUpload(uploadID gofakes3.UploadID) (*multipartState, bool) {
+	val, ok := b.uploads.Load(uploadID)
+	if !ok {
+		return nil, false
+	}
+	return val.(*multipartState), true
 }
 
 // removeUpload deletes the upload's temp directory and drops its bookkeeping.
@@ -320,8 +458,9 @@ func reapInterval(ttl time.Duration) time.Duration {
 // process; NewServer is called once at startup, so there is one reaper per
 // backend instance.
 func (b *s3Backend) startReaper() {
-	b.cleanupStaleDirs(time.Now(), multipartTTL())
-	interval := reapInterval(multipartTTL())
+	ttl := multipartTTL()
+	b.cleanupStaleDirs(time.Now(), ttl)
+	interval := reapInterval(ttl)
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -334,11 +473,14 @@ func (b *s3Backend) startReaper() {
 // reapExpired removes uploads whose lastActivity is older than ttl. It is safe
 // to call concurrently with UploadPart/Complete/Abort: each candidate is
 // re-checked under its own lock and removed atomically via removeUpload.
+// Uploads with an accepted-but-unfinished completion are never reaped — their
+// parts are being streamed by finalizeMultipart and must survive until it
+// succeeds or fails.
 func (b *s3Backend) reapExpired(now time.Time, ttl time.Duration) {
 	b.uploads.Range(func(key, val any) bool {
 		state := val.(*multipartState)
 		state.mu.Lock()
-		expired := now.Sub(state.lastActivity) > ttl
+		expired := now.Sub(state.lastActivity) > ttl && !state.completing
 		state.mu.Unlock()
 		if !expired {
 			return true
@@ -354,10 +496,7 @@ func (b *s3Backend) reapExpired(now time.Time, ttl time.Duration) {
 // crash; dirs younger than ttl are left alone so a concurrently-starting
 // sibling backend instance is never disturbed.
 func (b *s3Backend) cleanupStaleDirs(now time.Time, ttl time.Duration) {
-	tempDir := conf.Conf.TempDir
-	if tempDir == "" {
-		tempDir = os.TempDir()
-	}
+	tempDir := multipartTempDir()
 	entries, err := os.ReadDir(tempDir)
 	if err != nil {
 		return
