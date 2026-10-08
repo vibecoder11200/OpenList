@@ -53,8 +53,8 @@ func s3ErrorCode(err error) gofakes3.ErrorCode {
 
 // setupMultipartBackend prepares a Local storage mounted at /mpbucket and an
 // s3Backend with an "mp" bucket pointing at it. It returns the backend, the
-// local root directory on disk, and a cleanup function.
-func setupMultipartBackend(t *testing.T) (*s3Backend, string) {
+// local root directory on disk, and the storage id.
+func setupMultipartBackend(t *testing.T) (*s3Backend, string, uint) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -79,7 +79,7 @@ func setupMultipartBackend(t *testing.T) (*s3Backend, string) {
 		t.Fatalf("marshal local storage addition: %v", err)
 	}
 
-	_, err = op.CreateStorage(ctx, model.Storage{
+	sid, err := op.CreateStorage(ctx, model.Storage{
 		Driver:    "Local",
 		MountPath: mount,
 		Addition:  string(addition),
@@ -87,6 +87,12 @@ func setupMultipartBackend(t *testing.T) (*s3Backend, string) {
 	if err != nil {
 		t.Fatalf("create local storage: %+v", err)
 	}
+	t.Cleanup(func() {
+		// Re-enable first (deleting a disabled storage errors), then remove
+		// the row so a second -count iteration can recreate the same mount.
+		_ = op.EnableStorage(context.Background(), sid)
+		_ = op.DeleteStorageById(context.Background(), sid)
+	})
 
 	if err := op.SaveSettingItem(&model.SettingItem{
 		Key:   conf.S3Buckets,
@@ -95,7 +101,20 @@ func setupMultipartBackend(t *testing.T) (*s3Backend, string) {
 		t.Fatalf("save s3 buckets setting: %+v", err)
 	}
 
-	return newBackend().(*s3Backend), localRoot
+	return newBackend().(*s3Backend), localRoot, sid
+}
+
+// waitFor polls cond every 20ms until it returns true or the timeout elapses.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
 }
 
 func sanitizeTestName(name string) string {
@@ -103,34 +122,51 @@ func sanitizeTestName(name string) string {
 	return r.Replace(name)
 }
 
+// mustCreateUpload starts a multipart upload and fails the test on error.
+func mustCreateUpload(t *testing.T, b *s3Backend, bucket, object string, meta map[string]string) gofakes3.UploadID {
+	t.Helper()
+	id, err := b.CreateMultipartUpload(context.Background(), bucket, object, meta)
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload %s/%s: %+v", bucket, object, err)
+	}
+	return id
+}
+
+// mustUploadPart uploads one part and fails the test on error, returning the etag.
+func mustUploadPart(t *testing.T, b *s3Backend, bucket, object string, uploadID gofakes3.UploadID, n int, body string) string {
+	t.Helper()
+	etag, err := b.UploadPart(context.Background(), bucket, object, uploadID, n, int64(len(body)), strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("UploadPart %d: %+v", n, err)
+	}
+	return etag
+}
+
+// waitUploadGone blocks until the upload is removed from backend bookkeeping.
+func waitUploadGone(t *testing.T, b *s3Backend, uploadID gofakes3.UploadID) {
+	t.Helper()
+	waitFor(t, 10*time.Second, func() bool {
+		_, ok := b.uploads.Load(uploadID)
+		return !ok
+	})
+}
+
 func TestMultipartUploadEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	b, localRoot := setupMultipartBackend(t)
+	b, localRoot, _ := setupMultipartBackend(t)
 
 	meta := map[string]string{"Content-Type": "text/plain"}
-	uploadID, err := b.CreateMultipartUpload(ctx, "mp", "dir/hello.txt", meta)
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %+v", err)
-	}
+	uploadID := mustCreateUpload(t, b, "mp", "dir/hello.txt", meta)
 	if uploadID == "" {
 		t.Fatal("empty upload id")
 	}
 
-	part := func(n int, body string) string {
-		t.Helper()
-		etag, err := b.UploadPart(ctx, "mp", "dir/hello.txt", uploadID, n, int64(len(body)), strings.NewReader(body))
-		if err != nil {
-			t.Fatalf("UploadPart %d: %+v", n, err)
-		}
-		return etag
-	}
-
-	etag1 := part(1, "Hello, ")
-	etag2 := part(2, "multipart ")
-	etag3 := part(3, "world!")
+	etag1 := mustUploadPart(t, b, "mp", "dir/hello.txt", uploadID, 1, "Hello, ")
+	etag2 := mustUploadPart(t, b, "mp", "dir/hello.txt", uploadID, 2, "multipart ")
+	etag3 := mustUploadPart(t, b, "mp", "dir/hello.txt", uploadID, 3, "world!")
 
 	// Re-uploading the same part number overwrites it and returns a fresh etag.
-	if e := part(2, "multipart "); e != etag2 {
+	if e := mustUploadPart(t, b, "mp", "dir/hello.txt", uploadID, 2, "multipart "); e != etag2 {
 		t.Fatalf("re-upload part 2 etag = %q, want %q", e, etag2)
 	}
 
@@ -153,7 +189,7 @@ func TestMultipartUploadEndToEnd(t *testing.T) {
 	}
 
 	// Parts out of order.
-	_, _, err = b.CompleteMultipartUpload(ctx, "mp", "dir/hello.txt", uploadID, &gofakes3.CompleteMultipartUploadRequest{
+	_, _, err := b.CompleteMultipartUpload(ctx, "mp", "dir/hello.txt", uploadID, &gofakes3.CompleteMultipartUploadRequest{
 		Parts: []gofakes3.CompletedPart{
 			{PartNumber: 2, ETag: etag2},
 			{PartNumber: 1, ETag: etag1},
@@ -191,7 +227,8 @@ func TestMultipartUploadEndToEnd(t *testing.T) {
 		t.Fatal("upload was removed after a failed complete")
 	}
 
-	// Successful complete.
+	// Successful complete: returns immediately with the final etag; the
+	// object is assembled by the background finalizer (eventual consistency).
 	_, etag, err := b.CompleteMultipartUpload(ctx, "mp", "dir/hello.txt", uploadID, &gofakes3.CompleteMultipartUploadRequest{
 		Parts: []gofakes3.CompletedPart{
 			{PartNumber: 1, ETag: etag1},
@@ -206,33 +243,24 @@ func TestMultipartUploadEndToEnd(t *testing.T) {
 		t.Fatalf("complete etag = %q, want a quoted \"<hex>-3\" multipart etag", etag)
 	}
 
-	// The object must exist on disk with the concatenated content.
-	got, err := os.ReadFile(filepath.Join(localRoot, "dir", "hello.txt"))
-	if err != nil {
-		t.Fatalf("read resulting file: %+v", err)
-	}
-	want := []byte("Hello, multipart world!")
-	if !bytes.Equal(got, want) {
-		t.Fatalf("resulting file content = %q, want %q", got, want)
-	}
+	// The object must appear on disk with the concatenated content once the
+	// finalization finishes.
+	objPath := filepath.Join(localRoot, "dir", "hello.txt")
+	waitFor(t, 10*time.Second, func() bool {
+		got, err := os.ReadFile(objPath)
+		return err == nil && bytes.Equal(got, []byte("Hello, multipart world!"))
+	})
 
-	// Bookkeeping and temp files must be cleaned up on success.
-	if _, ok := b.uploads.Load(uploadID); ok {
-		t.Fatal("upload still tracked after successful complete")
-	}
+	// Bookkeeping and temp files are cleaned up asynchronously on success.
+	waitUploadGone(t, b, uploadID)
 }
 
 func TestMultipartAbort(t *testing.T) {
 	ctx := context.Background()
-	b, _ := setupMultipartBackend(t)
+	b, _, _ := setupMultipartBackend(t)
 
-	uploadID, err := b.CreateMultipartUpload(ctx, "mp", "abort.txt", nil)
-	if err != nil {
-		t.Fatalf("CreateMultipartUpload: %+v", err)
-	}
-	if _, err := b.UploadPart(ctx, "mp", "abort.txt", uploadID, 1, 3, strings.NewReader("abc")); err != nil {
-		t.Fatalf("UploadPart: %+v", err)
-	}
+	uploadID := mustCreateUpload(t, b, "mp", "abort.txt", nil)
+	mustUploadPart(t, b, "mp", "abort.txt", uploadID, 1, "abc")
 
 	state, _ := b.uploads.Load(uploadID)
 	dir := state.(*multipartState).dir
@@ -257,25 +285,17 @@ func TestMultipartAbort(t *testing.T) {
 }
 
 func TestMultipartReapExpired(t *testing.T) {
-	ctx := context.Background()
-	b, _ := setupMultipartBackend(t)
+	b, _, _ := setupMultipartBackend(t)
 
 	// An active upload (fresh lastActivity) must be kept.
-	freshID, err := b.CreateMultipartUpload(ctx, "mp", "fresh.txt", nil)
-	if err != nil {
-		t.Fatalf("create fresh upload: %+v", err)
-	}
+	freshID := mustCreateUpload(t, b, "mp", "fresh.txt", nil)
 
 	// An abandoned upload (stale lastActivity) must be reaped.
-	staleID, err := b.CreateMultipartUpload(ctx, "mp", "stale.txt", nil)
-	if err != nil {
-		t.Fatalf("create stale upload: %+v", err)
-	}
-	if _, err := b.UploadPart(ctx, "mp", "stale.txt", staleID, 1, 3, strings.NewReader("abc")); err != nil {
-		t.Fatalf("upload stale part: %+v", err)
-	}
-	staleState, _ := b.uploads.Load(staleID)
-	staleDir := staleState.(*multipartState).dir
+	staleID := mustCreateUpload(t, b, "mp", "stale.txt", nil)
+	mustUploadPart(t, b, "mp", "stale.txt", staleID, 1, "abc")
+	val, _ := b.uploads.Load(staleID)
+	st := val.(*multipartState)
+	staleDir := st.dir
 	if _, err := os.Stat(staleDir); err != nil {
 		t.Fatalf("stale temp dir missing: %+v", err)
 	}
@@ -283,9 +303,9 @@ func TestMultipartReapExpired(t *testing.T) {
 	// Force the stale upload's lastActivity well into the past.
 	ttl := 30 * time.Minute
 	now := time.Now()
-	staleState.(*multipartState).mu.Lock()
-	staleState.(*multipartState).lastActivity = now.Add(-2 * ttl)
-	staleState.(*multipartState).mu.Unlock()
+	st.mu.Lock()
+	st.lastActivity = now.Add(-2 * ttl)
+	st.mu.Unlock()
 
 	b.reapExpired(now, ttl)
 
@@ -301,7 +321,7 @@ func TestMultipartReapExpired(t *testing.T) {
 }
 
 func TestMultipartCleanupStaleDirs(t *testing.T) {
-	b, _ := setupMultipartBackend(t)
+	b, _, _ := setupMultipartBackend(t)
 
 	tempDir := conf.Conf.TempDir
 	staleDir, err := os.MkdirTemp(tempDir, multipartDirPrefix+"*")
@@ -329,4 +349,151 @@ func TestMultipartCleanupStaleDirs(t *testing.T) {
 		t.Fatalf("fresh dir should have been kept (err=%v)", err)
 	}
 	_ = os.RemoveAll(freshDir)
+}
+
+// TestMultipartCompleteIsAsync locks down the async-completion contract:
+// CompleteMultipartUpload must answer immediately (before the parts are
+// streamed to storage), deduplicate repeated Complete calls, and honor an
+// Abort that arrives while the finalization is still queued.
+func TestMultipartCompleteIsAsync(t *testing.T) {
+	ctx := context.Background()
+	b, localRoot, _ := setupMultipartBackend(t)
+
+	uploadID := mustCreateUpload(t, b, "mp", "async.txt", nil)
+	e1 := mustUploadPart(t, b, "mp", "async.txt", uploadID, 1, "abc")
+	e2 := mustUploadPart(t, b, "mp", "async.txt", uploadID, 2, "def")
+	parts := &gofakes3.CompleteMultipartUploadRequest{
+		Parts: []gofakes3.CompletedPart{
+			{PartNumber: 1, ETag: e1},
+			{PartNumber: 2, ETag: e2},
+		},
+	}
+
+	// Occupy both finalize slots so the finalization cannot start yet.
+	finalizeSlots <- struct{}{}
+	finalizeSlots <- struct{}{}
+
+	_, etag, err := b.CompleteMultipartUpload(ctx, "mp", "async.txt", uploadID, parts)
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload blocked or failed: %+v", err)
+	}
+	if !strings.HasSuffix(etag, `-2"`) {
+		t.Fatalf("etag = %q, want quoted \"<hex>-2\"", etag)
+	}
+
+	// The object must not exist yet: completion returned before finalization.
+	if _, err := os.Stat(filepath.Join(localRoot, "async.txt")); !os.IsNotExist(err) {
+		t.Fatalf("object exists before finalization ran (err=%v)", err)
+	}
+
+	// A repeated Complete while finalizing is deduplicated with the same etag.
+	_, etag2, err := b.CompleteMultipartUpload(ctx, "mp", "async.txt", uploadID, parts)
+	if err != nil {
+		t.Fatalf("deduplicated CompleteMultipartUpload: %+v", err)
+	}
+	if etag2 != etag {
+		t.Fatalf("dedup etag = %q, want %q", etag2, etag)
+	}
+
+	// Abort while the finalization is queued must be recorded, not rejected.
+	if err := b.AbortMultipartUpload(ctx, "mp", "async.txt", uploadID); err != nil {
+		t.Fatalf("AbortMultipartUpload while completing: %+v", err)
+	}
+
+	// Release the slots: the queued finalization observes the abort and drops
+	// the upload without writing the object.
+	<-finalizeSlots
+	<-finalizeSlots
+
+	waitUploadGone(t, b, uploadID)
+	if _, err := os.Stat(filepath.Join(localRoot, "async.txt")); !os.IsNotExist(err) {
+		t.Fatalf("object written despite abort before finalization (err=%v)", err)
+	}
+}
+
+// TestMultipartCompleteRetryAfterFailure verifies the retry contract when the
+// background finalization fails (here: the backing storage is disabled): the
+// upload must return to the retryable state, and a later Complete with the
+// same parts must succeed once the storage is back.
+func TestMultipartCompleteRetryAfterFailure(t *testing.T) {
+	ctx := context.Background()
+	b, localRoot, sid := setupMultipartBackend(t)
+
+	uploadID := mustCreateUpload(t, b, "mp", "retry.txt", nil)
+	e1 := mustUploadPart(t, b, "mp", "retry.txt", uploadID, 1, "abc")
+	parts := &gofakes3.CompleteMultipartUploadRequest{
+		Parts: []gofakes3.CompletedPart{{PartNumber: 1, ETag: e1}},
+	}
+
+	// Break the backing storage so the background finalization fails.
+	if err := op.DisableStorage(ctx, sid); err != nil {
+		t.Fatalf("DisableStorage: %+v", err)
+	}
+
+	if _, _, err := b.CompleteMultipartUpload(ctx, "mp", "retry.txt", uploadID, parts); err != nil {
+		t.Fatalf("CompleteMultipartUpload should be accepted even if storage is down: %+v", err)
+	}
+
+	// The failed finalization must put the upload back into retryable state.
+	waitFor(t, 10*time.Second, func() bool {
+		val, ok := b.uploads.Load(uploadID)
+		if !ok {
+			return false
+		}
+		st := val.(*multipartState)
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return !st.completing
+	})
+
+	// Repair the storage and retry with the same parts.
+	if err := op.EnableStorage(ctx, sid); err != nil {
+		t.Fatalf("EnableStorage: %+v", err)
+	}
+	_, etag, err := b.CompleteMultipartUpload(ctx, "mp", "retry.txt", uploadID, parts)
+	if err != nil {
+		t.Fatalf("retry CompleteMultipartUpload: %+v", err)
+	}
+	if !strings.HasSuffix(etag, `-1"`) {
+		t.Fatalf("etag = %q, want quoted \"<hex>-1\"", etag)
+	}
+
+	waitFor(t, 10*time.Second, func() bool {
+		got, err := os.ReadFile(filepath.Join(localRoot, "retry.txt"))
+		return err == nil && string(got) == "abc"
+	})
+	waitUploadGone(t, b, uploadID)
+}
+
+// TestMultipartReapSkipsCompleting verifies that the reaper never drops an
+// upload whose finalization is in progress, even if its lastActivity is stale.
+func TestMultipartReapSkipsCompleting(t *testing.T) {
+	b, _, _ := setupMultipartBackend(t)
+
+	uploadID := mustCreateUpload(t, b, "mp", "busy.txt", nil)
+
+	ttl := 30 * time.Minute
+	now := time.Now()
+
+	// Simulate an accepted completion that is still finalizing and looks stale.
+	val, _ := b.uploads.Load(uploadID)
+	st := val.(*multipartState)
+	st.mu.Lock()
+	st.completing = true
+	st.lastActivity = now.Add(-2 * ttl)
+	st.mu.Unlock()
+
+	b.reapExpired(now, ttl)
+	if _, ok := b.uploads.Load(uploadID); !ok {
+		t.Fatal("reaper dropped an upload while finalization was in progress")
+	}
+
+	// Once the finalization is done, staleness applies again.
+	st.mu.Lock()
+	st.completing = false
+	st.mu.Unlock()
+	b.reapExpired(now, ttl)
+	if _, ok := b.uploads.Load(uploadID); ok {
+		t.Fatal("stale upload still tracked after finalization ended")
+	}
 }
