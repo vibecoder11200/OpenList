@@ -113,6 +113,16 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 	if err != nil {
 		return nil, err
 	}
+
+	// A multipart upload whose completion was accepted but is still being
+	// finalized in the background: serve its pending metadata so clients
+	// verifying right after CompleteMultipartUpload (rclone checks size the
+	// moment the upload finishes) see the committed object instead of a 404
+	// and wrongly report "corrupted on transfer".
+	if obj := b.pendingHeadObject(bucketName, objectName); obj != nil {
+		return obj, nil
+	}
+
 	bucketPath := bucket.Path
 
 	fp := path.Join(bucketPath, objectName)

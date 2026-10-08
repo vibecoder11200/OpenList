@@ -348,6 +348,50 @@ func (s *multipartState) isAbortPending() bool {
 	return s.abortPending
 }
 
+// pendingHeadObject returns a synthetic object for a bucket/object pair whose
+// multipart completion has been accepted and is still being finalized in the
+// background (completing == true, completedEtag published). The data is not
+// readable yet, but HEAD must report the committed size so uploading clients
+// (rclone verifies size immediately after upload) do not misread the
+// finalize window as a corrupted/missing transfer.
+func (b *s3Backend) pendingHeadObject(bucket, object string) *gofakes3.Object {
+	var state *multipartState
+	b.uploads.Range(func(key, val any) bool {
+		st := val.(*multipartState)
+		st.mu.Lock()
+		match := st.completing && st.completedEtag != "" && st.bucket == bucket && st.object == object
+		st.mu.Unlock()
+		if match {
+			state = st
+			return false
+		}
+		return true
+	})
+	if state == nil {
+		return nil
+	}
+
+	state.mu.Lock()
+	var size int64
+	for _, p := range state.parts {
+		size += p.size
+	}
+	meta := map[string]string{
+		"Last-Modified": time.Now().UTC().Format(timeFormat),
+	}
+	if ct := state.meta["Content-Type"]; ct != "" {
+		meta["Content-Type"] = ct
+	}
+	state.mu.Unlock()
+
+	return &gofakes3.Object{
+		Name:     object,
+		Metadata: meta,
+		Size:     size,
+		Contents: noOpReadCloser{},
+	}
+}
+
 // AbortMultipartUpload discards an in-progress upload and its parts.
 //
 // It implements gofakes3.MultipartBackend and is idempotent: aborting an
