@@ -6,6 +6,9 @@ LABEL stage=go-builder
 WORKDIR /app/
 RUN apk add --no-cache bash curl jq gcc git go musl-dev
 COPY go.mod go.sum ./
+# The gofakes3 replace directive points here, so it must exist before
+# `go mod download` reads the module graph.
+COPY third_party/ ./third_party/
 RUN go mod download
 COPY ./ ./
 RUN bash build.sh release docker
