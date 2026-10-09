@@ -185,6 +185,26 @@ func TestAcceptEncodingProxyRewrite(t *testing.T) {
 		mutate func(req *http.Request)
 	}{
 		{
+			name: "HEAD rewritten to GET by proxy (Cloudflare cache behavior)",
+			mutate: func(req *http.Request) {
+				req.Method = http.MethodGet
+			},
+		},
+		{
+			name: "HEAD rewritten to GET and Accept-Encoding normalized to gzip, br",
+			mutate: func(req *http.Request) {
+				req.Method = http.MethodGet
+				req.Header.Set("Accept-Encoding", "gzip, br")
+			},
+		},
+		{
+			name: "HEAD rewritten to GET and Accept-Encoding stripped",
+			mutate: func(req *http.Request) {
+				req.Method = http.MethodGet
+				req.Header.Del("Accept-Encoding")
+			},
+		},
+		{
 			name: "Accept-Encoding stripped by proxy",
 			mutate: func(req *http.Request) {
 				req.Header.Del("Accept-Encoding")

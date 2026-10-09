@@ -35,20 +35,24 @@ func TestS3HeadThroughAcceptEncodingRewritingProxy(t *testing.T) {
 	)
 	faker := gofakes3.New(newBackend(), gofakes3.WithV4Auth(map[string]string{ak: sk}))
 
-	// Cloudflare stand-in: on HEAD requests rewrite Accept-Encoding (the
-	// "rewritten" case), and strip it entirely for the second round trip
-	// ("stripped" case).
+	// Cloudflare stand-in. The "cf" case replicates what Cloudflare actually
+	// does to a HEAD on the wire: reissue it to the origin as GET (cache
+	// semantics) and normalize Accept-Encoding to "gzip, br". The "stripped"
+	// case covers proxies that just drop the header.
 	for _, tc := range []struct {
 		name   string
-		mutate func(h http.Header)
+		mutate func(r *http.Request)
 	}{
-		{"rewritten", func(h http.Header) { h.Set("Accept-Encoding", "gzip") }},
-		{"stripped", func(h http.Header) { h.Del("Accept-Encoding") }},
+		{"cf-head-to-get", func(r *http.Request) {
+			r.Method = http.MethodGet
+			r.Header.Set("Accept-Encoding", "gzip, br")
+		}},
+		{"stripped", func(r *http.Request) { r.Header.Del("Accept-Encoding") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodHead {
-					tc.mutate(r.Header)
+					tc.mutate(r)
 				}
 				faker.Server().ServeHTTP(w, r)
 			})
