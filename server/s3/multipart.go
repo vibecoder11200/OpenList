@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,8 +18,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/gofakes3"
+	"github.com/ncw/swift/v2"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -63,8 +66,57 @@ type multipartState struct {
 	completedEtag string
 	abortPending  bool
 
+	// single marks a state created by PutObject's 1-part pipeline: no client
+	// will ever send CompleteMultipartUpload for it, so a failed finalize
+	// must retry itself instead of parking in the retryable state.
+	single bool
+	// finalizeRetries counts automatic finalize retries for single states.
+	finalizeRetries int
+
 	mu    sync.Mutex
 	parts map[int]*multipartPart
+}
+
+// finalizedObject is the committed metadata of an object whose background
+// finalize finished recently; it lets HeadObject answer without touching the
+// storage again (see s3Backend.recentFinalized).
+type finalizedObject struct {
+	size        int64
+	modTime     time.Time
+	contentType string
+	expires     time.Time
+}
+
+// singleFinalizeRetries caps how often a single-PUT finalize retries itself
+// before giving up and leaving the spooled file to the reaper.
+const singleFinalizeRetries = 3
+
+// finalizeTimeout bounds a background finalize: a storage fan-out that hangs
+// would otherwise hold one of the two finalize slots forever and wedge every
+// later write behind it. Generous enough for multi-GB objects over slow
+// storage; the deadline only exists to fail eventually instead of hanging.
+const finalizeTimeout = 2 * time.Hour
+
+// keyLockCount sizes the striped per-object lock table used to serialize
+// finalizes for the same object key: sequential PUTs to one key must commit
+// in order, or a slow older finalize can overwrite a newer one. Different
+// keys occasionally colliding on a stripe only costs some parallelism.
+const keyLockCount = 64
+
+var keyLocks [keyLockCount]sync.Mutex
+
+func lockFor(bucket, object string) *sync.Mutex {
+	h := fnv32(bucket + "/" + object)
+	return &keyLocks[h%keyLockCount]
+}
+
+func fnv32(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
 }
 
 // CreateMultipartUpload begins a new multipart upload. Parts are streamed to
@@ -96,6 +148,65 @@ func (b *s3Backend) CreateMultipartUpload(ctx context.Context, bucket, object st
 	b.uploads.Store(uploadID, state)
 	log.Debugf("s3 multipart: created upload %s for %s/%s", uploadID, bucket, object)
 	return uploadID, nil
+}
+
+// spoolSinglePut drains a PutObject body to a temp file and wraps it as a
+// completed single-part upload state, ready for the background finalize
+// pipeline. A short body is reported as ErrIncompleteBody so a truncated
+// client request is never acknowledged with success.
+func (b *s3Backend) spoolSinglePut(bucket, object string, meta map[string]string, input io.Reader, size int64) (*multipartState, gofakes3.UploadID, []*multipartPart, int64, error) {
+	dir, err := os.MkdirTemp(multipartTempDir(), "s3-put-*")
+	if err != nil {
+		return nil, "", nil, 0, fmt.Errorf("create put dir: %w", err)
+	}
+	partPath := filepath.Join(dir, "part-00001")
+
+	f, err := os.Create(partPath)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, "", nil, 0, fmt.Errorf("create part file: %w", err)
+	}
+	partFailed := true
+	defer func() {
+		if partFailed {
+			_ = f.Close()
+			_ = os.RemoveAll(dir)
+		}
+	}()
+
+	n, err := io.Copy(f, input)
+	if err != nil {
+		return nil, "", nil, 0, err
+	}
+	if size >= 0 && n != size {
+		return nil, "", nil, 0, gofakes3.ErrIncompleteBody
+	}
+	if err := f.Close(); err != nil {
+		return nil, "", nil, 0, err
+	}
+	partFailed = false
+
+	now := time.Now()
+	uploadID := gofakes3.UploadID("single-" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	state := &multipartState{
+		bucket:       bucket,
+		object:       object,
+		meta:         meta,
+		dir:          dir,
+		created:      now,
+		lastActivity: now,
+		// pendingHeadObject matches states with completing && completedEtag
+		// != "". Single states have no Complete call, so seed a placeholder
+		// etag that is never handed to any client.
+		completing:    true,
+		completedEtag: "-",
+		single:        true,
+		parts: map[int]*multipartPart{
+			1: {path: partPath, size: n, updated: now},
+		},
+	}
+	ordered := []*multipartPart{state.parts[1]}
+	return state, uploadID, ordered, n, nil
 }
 
 // UploadPart writes a single part to disk and returns its (quoted) MD5 etag.
@@ -293,7 +404,7 @@ func (b *s3Backend) finalizeMultipart(uploadID gofakes3.UploadID, state *multipa
 			for _, c := range closers {
 				_ = c.Close()
 			}
-			b.finalizeFailed(uploadID, state, fmt.Errorf("open part %s: %w", part.path, err))
+			b.finalizeFailed(uploadID, state, ordered, total, fmt.Errorf("open part %s: %w", part.path, err))
 			return
 		}
 		readers = append(readers, f)
@@ -310,13 +421,56 @@ func (b *s3Backend) finalizeMultipart(uploadID gofakes3.UploadID, state *multipa
 		return firstErr
 	})
 
-	err := b.putStream(context.Background(), state.bucket, state.object, state.meta, combined, total)
+	// Serialize finalizes per object key: sequential writes acknowledged to a
+	// client must commit in order, otherwise a slow older finalize (e.g. one
+	// still fanning out across an alias) can overwrite a newer one.
+	klock := lockFor(state.bucket, state.object)
+	klock.Lock()
+	fctx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
+	err := b.putStream(fctx, state.bucket, state.object, state.meta, combined, total)
+	cancel()
+	klock.Unlock()
 	_ = combined.Close()
 
 	if err != nil {
-		b.finalizeFailed(uploadID, state, err)
+		b.finalizeFailed(uploadID, state, ordered, total, err)
 		return
 	}
+
+	// A delete that arrived while this finalize was running must win: drop
+	// the write without publishing hot metadata, so the object does not
+	// resurrect after the client saw the delete succeed. The durable write
+	// already happened, so undo it best-effort.
+	if state.isAbortPending() {
+		b.removeUpload(uploadID)
+		b.recentFinalized.Delete(state.bucket + "/" + state.object)
+		if bucket, err := getBucketByName(state.bucket); err == nil {
+			if err := fs.Remove(context.Background(), path.Join(bucket.Path, state.object)); err != nil {
+				log.Warnf("s3 multipart: could not undo finalize for %s/%s after delete: %v", state.bucket, state.object, err)
+			}
+		}
+		log.Infof("s3 multipart: dropped finalize result for %s (%s/%s), deleted while finalizing", uploadID, state.bucket, state.object)
+		return
+	}
+
+	// Keep the committed metadata hot so verification HEADs arriving right
+	// after this moment do not pay for resolving the storage again.
+	modTime := time.Now()
+	if val, ok := state.meta["X-Amz-Meta-Mtime"]; ok {
+		if t, err := swift.FloatStringToTime(val); err == nil {
+			modTime = t
+		}
+	} else if val, ok := state.meta["mtime"]; ok {
+		if t, err := swift.FloatStringToTime(val); err == nil {
+			modTime = t
+		}
+	}
+	b.recentFinalized.Store(state.bucket+"/"+state.object, &finalizedObject{
+		size:        total,
+		modTime:     modTime,
+		contentType: state.meta["Content-Type"],
+		expires:     time.Now().Add(finalizedTTL),
+	})
 
 	b.removeUpload(uploadID)
 	log.Debugf("s3 multipart: completed upload %s -> %s/%s (%d bytes)", uploadID, state.bucket, state.object, total)
@@ -326,7 +480,43 @@ func (b *s3Backend) finalizeMultipart(uploadID gofakes3.UploadID, state *multipa
 // CompleteMultipartUpload to retry. Parts and their files stay in place; only
 // a reaped upload would drop them. A pending abort wins over retryability and
 // removes the upload outright.
-func (b *s3Backend) finalizeFailed(uploadID gofakes3.UploadID, state *multipartState, err error) {
+//
+// Single-PUT states (PutObject pipeline) have no client that could re-issue
+// Complete, so they retry themselves with a short backoff before giving up;
+// a gave-up state keeps completing=false and is cleaned by the reaper.
+func (b *s3Backend) finalizeFailed(uploadID gofakes3.UploadID, state *multipartState, ordered []*multipartPart, total int64, err error) {
+	if state.single && !state.isAbortPending() {
+		state.mu.Lock()
+		giveUp := state.finalizeRetries >= singleFinalizeRetries
+		if !giveUp {
+			state.finalizeRetries++
+			// Keep completing=true so pending HEADs continue to report the
+			// committed size while the retry is pending.
+		} else {
+			state.completing = false
+			state.completedEtag = ""
+		}
+		state.lastActivity = time.Now()
+		state.mu.Unlock()
+
+		if giveUp {
+			// No retry goroutine is pending: reclaim the state (and its
+			// spooled part files) immediately instead of waiting a full
+			// reaper TTL.
+			b.removeUpload(uploadID)
+			log.Errorf("s3 multipart: single finalize %s (%s/%s) gave up after %d retries, last error: %v",
+				uploadID, state.bucket, state.object, singleFinalizeRetries, err)
+			return
+		}
+		log.Warnf("s3 multipart: single finalize %s (%s/%s) failed (%v), retrying in background",
+			uploadID, state.bucket, state.object, err)
+		go func() {
+			time.Sleep(time.Duration(state.finalizeRetries) * 2 * time.Second)
+			b.finalizeMultipart(uploadID, state, ordered, total)
+		}()
+		return
+	}
+
 	state.mu.Lock()
 	state.completing = false
 	state.completedEtag = ""
@@ -348,6 +538,18 @@ func (s *multipartState) isAbortPending() bool {
 	return s.abortPending
 }
 
+// sweepRecentFinalized drops finalized-metadata entries whose TTL elapsed, so
+// a write-many-read-never workload cannot grow the map unboundedly between
+// restarts.
+func (b *s3Backend) sweepRecentFinalized(now time.Time) {
+	b.recentFinalized.Range(func(key, val any) bool {
+		if fo := val.(*finalizedObject); now.After(fo.expires) {
+			b.recentFinalized.Delete(key)
+		}
+		return true
+	})
+}
+
 // pendingHeadObject returns a synthetic object for a bucket/object pair whose
 // multipart completion has been accepted and is still being finalized in the
 // background (completing == true, completedEtag published). The data is not
@@ -356,14 +558,18 @@ func (s *multipartState) isAbortPending() bool {
 // finalize window as a corrupted/missing transfer.
 func (b *s3Backend) pendingHeadObject(bucket, object string) *gofakes3.Object {
 	var state *multipartState
+	var bestActivity time.Time
 	b.uploads.Range(func(key, val any) bool {
 		st := val.(*multipartState)
 		st.mu.Lock()
 		match := st.completing && st.completedEtag != "" && st.bucket == bucket && st.object == object
+		activity := st.lastActivity
 		st.mu.Unlock()
-		if match {
+		// An overwrite can be finalizing while the older write's state is
+		// still around: prefer the most recently active one.
+		if match && (state == nil || activity.After(bestActivity)) {
 			state = st
-			return false
+			bestActivity = activity
 		}
 		return true
 	})
@@ -469,6 +675,7 @@ func (p *multipartPart) md5Bytes() []byte {
 const (
 	defaultMultipartTTL = 24 * time.Hour
 	multipartDirPrefix  = "s3-multipart-"
+	singlePutDirPrefix  = "s3-put-"
 )
 
 // multipartTTL returns the configured max idle time for an upload before the
@@ -510,6 +717,7 @@ func (b *s3Backend) startReaper() {
 		defer ticker.Stop()
 		for now := range ticker.C {
 			b.reapExpired(now, multipartTTL())
+			b.sweepRecentFinalized(now)
 		}
 	}()
 }
@@ -535,10 +743,10 @@ func (b *s3Backend) reapExpired(now time.Time, ttl time.Duration) {
 	})
 }
 
-// cleanupStaleDirs removes s3-multipart-* directories under TempDir that are
-// older than ttl. This reclaims part files left behind by a previous process
-// crash; dirs younger than ttl are left alone so a concurrently-starting
-// sibling backend instance is never disturbed.
+// cleanupStaleDirs removes s3-multipart-* and s3-put-* directories under
+// TempDir that are older than ttl. This reclaims part files left behind by a
+// previous process crash; dirs younger than ttl are left alone so a
+// concurrently-starting sibling backend instance is never disturbed.
 func (b *s3Backend) cleanupStaleDirs(now time.Time, ttl time.Duration) {
 	tempDir := multipartTempDir()
 	entries, err := os.ReadDir(tempDir)
@@ -547,7 +755,8 @@ func (b *s3Backend) cleanupStaleDirs(now time.Time, ttl time.Duration) {
 	}
 	cutoff := now.Add(-ttl)
 	for _, e := range entries {
-		if !e.IsDir() || !strings.HasPrefix(e.Name(), multipartDirPrefix) {
+		if !e.IsDir() ||
+			(!strings.HasPrefix(e.Name(), multipartDirPrefix) && !strings.HasPrefix(e.Name(), singlePutDirPrefix)) {
 			continue
 		}
 		info, err := e.Info()

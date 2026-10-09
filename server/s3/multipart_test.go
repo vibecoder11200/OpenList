@@ -551,3 +551,193 @@ func TestMultipartReapSkipsCompleting(t *testing.T) {
 		t.Fatal("stale upload still tracked after finalization ended")
 	}
 }
+
+// --- Single-PUT async pipeline (PutObject -> spool -> background finalize) ---
+
+// TestSinglePutHeadReportsCommittedSizeImmediately verifies the contract
+// uploading clients depend on: PutObject returns right away (the body is
+// spooled), and a HEAD issued in the same instant reports the committed size
+// instead of NoSuchKey.
+func TestSinglePutHeadReportsCommittedSizeImmediately(t *testing.T) {
+	ctx := context.Background()
+	b, localRoot, _ := setupMultipartBackend(t)
+
+	// Block both finalize slots so the background finalize cannot run yet.
+	finalizeSlots <- struct{}{}
+	finalizeSlots <- struct{}{}
+
+	body := "single-put-payload-0123456789"
+	if _, err := b.PutObject(ctx, "mp", "instant/hello.txt", map[string]string{"Content-Type": "text/plain"}, strings.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("PutObject: %+v", err)
+	}
+
+	obj, err := b.HeadObject(ctx, "mp", "instant/hello.txt")
+	if err != nil {
+		t.Fatalf("HEAD right after PutObject: %+v", err)
+	}
+	if obj.Size != int64(len(body)) {
+		t.Fatalf("HEAD size = %d, want %d", obj.Size, len(body))
+	}
+
+	// Release the finalize slots; the object must become durable.
+	<-finalizeSlots
+	<-finalizeSlots
+
+	waitFor(t, 10*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(localRoot, "instant", "hello.txt"))
+		return err == nil && string(data) == body
+	})
+}
+
+// TestSinglePutShortBodyFailsSync ensures a truncated request is rejected
+// synchronously (ErrIncompleteBody) and leaves nothing behind.
+func TestSinglePutShortBodyFailsSync(t *testing.T) {
+	ctx := context.Background()
+	b, _, _ := setupMultipartBackend(t)
+
+	if _, err := b.PutObject(ctx, "mp", "short/x.txt", nil, strings.NewReader("abc"), 10); s3ErrorCode(err) != gofakes3.ErrIncompleteBody {
+		t.Fatalf("short body error = %v, want ErrIncompleteBody", err)
+	}
+
+	empty := true
+	b.uploads.Range(func(_, _ any) bool { empty = false; return false })
+	if !empty {
+		t.Fatal("short body left an upload state behind")
+	}
+}
+
+// TestSinglePutFinalizedHeadCache proves the finalized-metadata cache serves
+// HEADs after the background write completes, without touching storage.
+func TestSinglePutFinalizedHeadCache(t *testing.T) {
+	ctx := context.Background()
+	b, localRoot, _ := setupMultipartBackend(t)
+
+	body := "cached-head-payload"
+	if _, err := b.PutObject(ctx, "mp", "cached/a.txt", nil, strings.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("PutObject: %+v", err)
+	}
+
+	// Wait until the finalize pipeline published the hot metadata.
+	waitFor(t, 10*time.Second, func() bool {
+		_, ok := b.recentFinalized.Load("mp/cached/a.txt")
+		return ok
+	})
+
+	// Remove the backing file: the recent metadata must still answer the HEAD.
+	if err := os.Remove(filepath.Join(localRoot, "cached", "a.txt")); err != nil {
+		t.Fatalf("remove backing file: %v", err)
+	}
+	obj, err := b.HeadObject(ctx, "mp", "cached/a.txt")
+	if err != nil {
+		t.Fatalf("HEAD after finalize with storage removed: %+v", err)
+	}
+	if obj.Size != int64(len(body)) {
+		t.Fatalf("HEAD size = %d, want %d", obj.Size, len(body))
+	}
+}
+
+// TestSinglePutDeleteInvalidatesFinalizedCache keeps DELETE authoritative:
+// after deleting an object its hot finalize metadata must not resurrect it.
+func TestSinglePutDeleteInvalidatesFinalizedCache(t *testing.T) {
+	ctx := context.Background()
+	b, _, _ := setupMultipartBackend(t)
+
+	body := "delete-me"
+	if _, err := b.PutObject(ctx, "mp", "todelete/a.txt", nil, strings.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("PutObject: %+v", err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		_, ok := b.recentFinalized.Load("mp/todelete/a.txt")
+		return ok
+	})
+
+	if _, err := b.DeleteObject(ctx, "mp", "todelete/a.txt"); err != nil {
+		t.Fatalf("DeleteObject: %+v", err)
+	}
+	if _, ok := b.recentFinalized.Load("mp/todelete/a.txt"); ok {
+		t.Fatal("delete left finalized metadata in the cache")
+	}
+}
+
+// TestSinglePutDirMarkerStaysSynchronous checks that trailing-slash objects
+// (directory markers) still create the folder synchronously.
+func TestSinglePutDirMarkerStaysSynchronous(t *testing.T) {
+	ctx := context.Background()
+	b, localRoot, _ := setupMultipartBackend(t)
+
+	if _, err := b.PutObject(ctx, "mp", "marker/", nil, strings.NewReader(""), 0); err != nil {
+		t.Fatalf("PutObject dir marker: %+v", err)
+	}
+	if st, err := os.Stat(filepath.Join(localRoot, "marker")); err != nil || !st.IsDir() {
+		t.Fatalf("marker dir missing after sync put: %v", err)
+	}
+}
+
+// TestSinglePutFinalizeRetriesItself disables the backing storage so the
+// background finalize fails; the single-PUT pipeline must retry itself and
+// succeed once the storage returns, with no client re-issuing anything.
+func TestSinglePutFinalizeRetriesItself(t *testing.T) {
+	ctx := context.Background()
+	b, localRoot, sid := setupMultipartBackend(t)
+
+	if err := op.DisableStorage(ctx, sid); err != nil {
+		t.Fatalf("DisableStorage: %+v", err)
+	}
+	body := "retry-me"
+	if _, err := b.PutObject(ctx, "mp", "retry/x.txt", nil, strings.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("PutObject: %+v", err)
+	}
+
+	// First finalize fails fast (disabled storage), the retry backoff then
+	// waits; repair before the retry budget is spent.
+	if err := op.EnableStorage(ctx, sid); err != nil {
+		t.Fatalf("EnableStorage: %+v", err)
+	}
+
+	waitFor(t, 30*time.Second, func() bool {
+		data, err := os.ReadFile(filepath.Join(localRoot, "retry", "x.txt"))
+		return err == nil && string(data) == body
+	})
+
+	// The state must be fully reclaimed once the retry succeeds.
+	waitFor(t, 10*time.Second, func() bool {
+		empty := true
+		b.uploads.Range(func(_, _ any) bool { empty = false; return false })
+		return empty
+	})
+}
+
+// TestSinglePutDeleteDuringFinalizeWins keeps a delete issued inside the
+// finalize window authoritative: the in-flight background write must not
+// resurrect the object afterwards.
+func TestSinglePutDeleteDuringFinalizeWins(t *testing.T) {
+	ctx := context.Background()
+	b, _, _ := setupMultipartBackend(t)
+
+	// Block the finalize slots so the window is observable.
+	finalizeSlots <- struct{}{}
+	finalizeSlots <- struct{}{}
+
+	body := "doomed"
+	if _, err := b.PutObject(ctx, "mp", "doomed/a.txt", nil, strings.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("PutObject: %+v", err)
+	}
+	if _, err := b.DeleteObject(ctx, "mp", "doomed/a.txt"); err != nil {
+		t.Fatalf("DeleteObject: %+v", err)
+	}
+
+	<-finalizeSlots
+	<-finalizeSlots
+
+	// After the finalize finishes it must honor the delete: no hot metadata,
+	// no state left, and (storage still enabled) HEAD falls through to 404.
+	waitFor(t, 10*time.Second, func() bool {
+		_, hotOk := b.recentFinalized.Load("mp/doomed/a.txt")
+		empty := true
+		b.uploads.Range(func(_, _ any) bool { empty = false; return false })
+		return !hotOk && empty
+	})
+	if _, err := b.HeadObject(ctx, "mp", "doomed/a.txt"); s3ErrorCode(err) != gofakes3.ErrNoSuchKey {
+		t.Fatalf("HEAD after delete-while-finalizing = %v, want NoSuchKey", err)
+	}
+}

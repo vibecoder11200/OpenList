@@ -41,14 +41,23 @@ type s3Backend struct {
 	meta    *sync.Map
 	listDir func(context.Context, string) ([]model.Obj, error)
 	uploads *sync.Map // map[gofakes3.UploadID]*multipartState
+	// recentFinalized keeps the committed size/modtime of recently stored
+	// objects (key "bucket/object", TTL below) so verification HEADs right
+	// after a background finalize do not have to resolve the storage again.
+	recentFinalized *sync.Map // map[string]*finalizedObject
 }
+
+// finalizedTTL bounds how long a finalized object's metadata is served
+// without touching the underlying storage.
+const finalizedTTL = 10 * time.Minute
 
 // newBackend creates a new SimpleBucketBackend.
 func newBackend() gofakes3.Backend {
 	b := &s3Backend{
-		meta:    new(sync.Map),
-		uploads: new(sync.Map),
-		listDir: getDirEntries,
+		meta:            new(sync.Map),
+		uploads:         new(sync.Map),
+		recentFinalized: new(sync.Map),
+		listDir:         getDirEntries,
 	}
 	b.startReaper()
 	return b
@@ -121,6 +130,29 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 	// and wrongly report "corrupted on transfer".
 	if obj := b.pendingHeadObject(bucketName, objectName); obj != nil {
 		return obj, nil
+	}
+
+	// Recently finalized objects (background write finished a moment ago):
+	// serve the committed metadata instead of re-resolving the storage, so
+	// verification HEADs that arrive right after the finalize window stay
+	// fast even when the bucket is backed by a wide alias.
+	if v, ok := b.recentFinalized.Load(bucketName + "/" + objectName); ok {
+		fo := v.(*finalizedObject)
+		if time.Now().Before(fo.expires) {
+			meta := map[string]string{
+				"Last-Modified": fo.modTime.UTC().Format(timeFormat),
+			}
+			if ct := fo.contentType; ct != "" {
+				meta["Content-Type"] = ct
+			}
+			return &gofakes3.Object{
+				Name:     objectName,
+				Metadata: meta,
+				Size:     fo.size,
+				Contents: noOpReadCloser{},
+			}, nil
+		}
+		b.recentFinalized.Delete(bucketName + "/" + objectName)
 	}
 
 	bucketPath := bucket.Path
@@ -246,13 +278,41 @@ func (b *s3Backend) TouchObject(ctx context.Context, fp string, meta map[string]
 	return result, gofakes3.ErrNotImplemented
 }
 
-// PutObject creates or overwrites the object with the given name.
+// PutObject accepts an object write, spools the body to local disk and hands
+// durability to the same background finalize pipeline used by multipart
+// uploads.
+//
+// Why async: a bucket may be backed by an alias storage that fans every
+// write out across hundreds of backend storages; doing that inside the
+// request lets reverse proxies (Cloudflare kills origins after ~100 s)
+// time the PUT out. Returning after the body is spooled keeps that cost in
+// the background. gofakes3 computes the response ETag from the body it
+// streamed to us and its Content-MD5 check runs while we spool, so the
+// client still gets a fully validated result.
+//
+// During the finalize window HeadObject reports the committed size through
+// the pending-metadata path shared with multipart completion.
 func (b *s3Backend) PutObject(
 	ctx context.Context, bucketName, objectName string,
 	meta map[string]string,
 	input io.Reader, size int64,
 ) (result gofakes3.PutObjectResult, err error) {
-	return result, b.putStream(ctx, bucketName, objectName, meta, input, size)
+	if _, err := getBucketByName(bucketName); err != nil {
+		return result, err
+	}
+	// Directory markers stay synchronous: they map to MakeDir, are tiny,
+	// rare, and not sent by rclone during plain copy runs.
+	if strings.HasSuffix(objectName, "/") {
+		return result, b.putStream(ctx, bucketName, objectName, meta, input, size)
+	}
+
+	state, uploadID, ordered, total, err := b.spoolSinglePut(bucketName, objectName, meta, input, size)
+	if err != nil {
+		return result, err
+	}
+	b.uploads.Store(uploadID, state)
+	go b.finalizeMultipart(uploadID, state, ordered, total)
+	return result, nil
 }
 
 // putStream stores the given object into the underlying storage. It is shared
@@ -388,6 +448,20 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 	}
 
 	fs.Remove(ctx, fp)
+	// Drop any hot finalize metadata so a HEAD after the delete cannot answer
+	// with a stale "object exists", and mark matching in-flight finalizes
+	// aborted so a delete acknowledged now is not resurrected by a background
+	// write that finishes later.
+	b.recentFinalized.Delete(bucketName + "/" + objectName)
+	b.uploads.Range(func(_, val any) bool {
+		st := val.(*multipartState)
+		st.mu.Lock()
+		if st.bucket == bucketName && st.object == objectName && st.completing {
+			st.abortPending = true
+		}
+		st.mu.Unlock()
+		return true
+	})
 	return nil
 }
 
