@@ -273,29 +273,45 @@ func v4SignVerify(r *http.Request, getSecret func(accessKey string) (string, Err
 		hashedPayload = "UNSIGNED-PAYLOAD"
 	}
 
-	computeSignature := func(headers http.Header) string {
-		canonicalRequest := getCanonicalRequest(headers, hashedPayload, rawquery, req.URL.Path, req.Method)
+	computeSignature := func(headers http.Header, method string) string {
+		canonicalRequest := getCanonicalRequest(headers, hashedPayload, rawquery, req.URL.Path, method)
 		stringToSign := getStringToSign(canonicalRequest, t, signV4Values.Credential.getScope())
 		return getSignature(signingKey, stringToSign)
 	}
 
 	// Verify if signature match.
-	if compareSignatureV4(computeSignature(extractedSignedHeaders), signV4Values.Signature) {
+	if compareSignatureV4(computeSignature(extractedSignedHeaders, req.Method), signV4Values.Signature) {
 		return ErrNone
 	}
 
-	// Reverse proxies may rewrite or strip a signed Accept-Encoding after the
-	// client signed the request (Cloudflare rewrites it on HEAD requests,
-	// which breaks every rclone upload through a tunnel with a
-	// SignatureDoesNotMatch). The original value cannot be recovered, so
-	// retry the computation with the values common clients sign.
+	// Cloudflare (and some other reverse proxies) turn HEAD requests into
+	// GET when fetching from the origin for cache purposes: the signature
+	// was computed for HEAD while the request arrives as GET, failing every
+	// verification (rclone's post-upload HeadObject died on this through
+	// tunnels). Retry the canonical computation with the sibling method.
+	if req.Method == "GET" {
+		if compareSignatureV4(computeSignature(extractedSignedHeaders, "HEAD"), signV4Values.Signature) {
+			return ErrNone
+		}
+	}
+
+	// Reverse proxies may additionally rewrite or strip a signed
+	// Accept-Encoding (Cloudflare normalizes it to "gzip, br"). The original
+	// value cannot be recovered, so retry with the values common clients
+	// sign, crossed with both read-only methods.
 	if contains(signV4Values.SignedHeaders, "accept-encoding") {
 		received := extractedSignedHeaders.Get("Accept-Encoding")
+		methods := []string{req.Method}
+		if req.Method == "GET" {
+			methods = append(methods, "HEAD")
+		}
 		for _, candidate := range acceptEncodingFallbacks(received) {
 			trial := extractedSignedHeaders.Clone()
 			trial.Set("Accept-Encoding", candidate)
-			if compareSignatureV4(computeSignature(trial), signV4Values.Signature) {
-				return ErrNone
+			for _, method := range methods {
+				if compareSignatureV4(computeSignature(trial, method), signV4Values.Signature) {
+					return ErrNone
+				}
 			}
 		}
 	}
@@ -308,7 +324,7 @@ func v4SignVerify(r *http.Request, getSecret func(accessKey string) (string, Err
 // signed by the common S3 clients (aws-sdk-go/v2 sends identity on HEAD,
 // rclone and browsers send gzip variants).
 func acceptEncodingFallbacks(received string) []string {
-	fallbacks := []string{"identity", "gzip", "gzip, deflate", "gzip, deflate, br", ""}
+	fallbacks := []string{"identity", "gzip", "gzip, br", "gzip, deflate", "gzip, deflate, br", ""}
 	out := fallbacks[:0:0]
 	for _, v := range fallbacks {
 		if v != received {
