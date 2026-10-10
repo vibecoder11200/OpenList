@@ -209,6 +209,7 @@ type MediafirePollResponse struct {
 			Result      string `json:"result"`
 			Status      string `json:"status"`
 			Description string `json:"description"`
+			FileError   string `json:"fileerror"`
 			QuickKey    string `json:"quickkey"`
 			Hash        string `json:"hash"`
 			Filename    string `json:"filename"`

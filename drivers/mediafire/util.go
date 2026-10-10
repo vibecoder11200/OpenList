@@ -583,6 +583,10 @@ func (d *Mediafire) uploadUnits(ctx context.Context, file model.FileStreamer, ch
 					return fmt.Errorf("resumable upload failed with status %d", res.StatusCode)
 				}
 
+				if uploadResp.Response.Doupload.Key == "" {
+					return fmt.Errorf("mediafire: unit %d upload returned no key (result %s)", unitID, uploadResp.Response.Result)
+				}
+
 				// Thread-safe update of final upload key
 				keyMutex.Lock()
 				finalUploadKey = uploadResp.Response.Doupload.Key
@@ -655,36 +659,125 @@ func (d *Mediafire) getActionToken(ctx context.Context) (string, error) {
 	return resp.Response.ActionToken, nil
 }
 
+// pollUpload polls upload/poll_upload.php until MediaFire reports the upload
+// as complete. A single poll is not enough for multi-unit files: after the
+// last unit is transferred the server keeps answering 18 ("waiting for
+// assembly") / 19 ("assembling file") and only status 99 carries the quickkey
+// of the finished file. Returning on the first answer made large uploads look
+// successful while the file never materialized.
 func (d *Mediafire) pollUpload(ctx context.Context, key string) (*MediafirePollResponse, error) {
-	actionToken, err := d.getActionToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get action token: %w", err)
+	if key == "" {
+		return nil, fmt.Errorf("mediafire: upload key is empty, units did not produce a key")
 	}
+	const (
+		pollTimeout  = 10 * time.Minute
+		initialDelay = 2 * time.Second
+		maxDelay     = 5 * time.Second
+	)
+	deadline := time.Now().Add(pollTimeout)
+	delay := initialDelay
+	for {
+		actionToken, err := d.getActionToken(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get action token: %w", err)
+		}
 
-	// fmt.Printf("Debug Key: %+v\n", key)
+		query := map[string]string{
+			"key":             key,
+			"response_format": "json",
+			"session_token":   actionToken,
+		}
 
-	query := map[string]string{
-		"key":             key,
-		"response_format": "json",
-		"session_token":   actionToken, /* d.SessionToken */
+		var resp MediafirePollResponse
+		_, err = d.postForm(ctx, "/upload/poll_upload.php", query, &resp)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := checkAPIResult(resp.Response.Result); err != nil {
+			return nil, err
+		}
+
+		dl := resp.Response.Doupload
+		outcome, reason := pollDecision(dl.Status, dl.Result, dl.FileError, dl.QuickKey)
+		switch outcome {
+		case pollSuccess:
+			return &resp, nil
+		case pollTerminal:
+			return nil, fmt.Errorf("mediafire: upload failed: %s", reason)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("mediafire: upload not finalized within %s (last status %s: %s)",
+				pollTimeout, dl.Status, dl.Description)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < maxDelay {
+			delay += time.Second
+		}
 	}
+}
 
-	var resp MediafirePollResponse
-	_, err = d.postForm(ctx, "/upload/poll_upload.php", query, &resp)
-	if err != nil {
-		return nil, err
+type pollOutcome int
+
+const (
+	pollContinue pollOutcome = iota
+	pollSuccess
+	pollTerminal
+)
+
+// pollDecision classifies one poll_upload doupload block. Status codes per
+// the MediaFire API: 2 key ready, 3/17 upload in progress, 4 upload
+// completed, 5/6/11 verification, 18 waiting for assembly, 19 assembling
+// file — all keep polling. Only 99 is terminal success (quickkey present);
+// result -20/-80 mark a dead upload key, and a non-empty fileerror on 99
+// means the finished upload was rejected (virus, storage limit, ...).
+func pollDecision(status, result, fileError, quickKey string) (pollOutcome, string) {
+	if result == "-20" || result == "-80" {
+		return pollTerminal, fmt.Sprintf("upload key rejected (result %s)", result)
 	}
-
-	// fmt.Printf("pollUpload :: Raw response: %s\n", string(body))
-	// fmt.Printf("pollUpload :: Parsed response: %+v\n", resp)
-
-	// fmt.Printf("pollUpload :: Debug Result: %+v\n", resp.Response.Result)
-
-	if err := checkAPIResult(resp.Response.Result); err != nil {
-		return nil, err
+	if status == "99" {
+		if fileError != "" {
+			return pollTerminal, fmt.Sprintf("upload rejected (status 99, fileerror %s)", fileErrorText(fileError))
+		}
+		if quickKey == "" {
+			return pollTerminal, "upload reported complete (status 99) but no quickkey was returned"
+		}
+		return pollSuccess, ""
 	}
+	return pollContinue, ""
+}
 
-	return &resp, nil
+// fileErrorText maps the documented fileerror codes to human-readable
+// reasons so failures surface with an actionable message.
+func fileErrorText(code string) string {
+	switch code {
+	case "1":
+		return "maximum file size exceeded"
+	case "2":
+		return "file size is zero"
+	case "5":
+		return "virus found"
+	case "7":
+		return "file hash or size mismatch"
+	case "13":
+		return "duplicate filename skipped"
+	case "14":
+		return "destination folder missing"
+	case "15":
+		return "storage limit reached"
+	case "16":
+		return "update revision conflict"
+	case "18":
+		return "account blocked"
+	case "19":
+		return "path creation failure"
+	default:
+		return "code " + code
+	}
 }
 
 func (d *Mediafire) isUnitUploaded(words []int, unitID int) bool {
