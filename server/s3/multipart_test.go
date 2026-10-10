@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -740,4 +741,113 @@ func TestSinglePutDeleteDuringFinalizeWins(t *testing.T) {
 	if _, err := b.HeadObject(ctx, "mp", "doomed/a.txt"); s3ErrorCode(err) != gofakes3.ErrNoSuchKey {
 		t.Fatalf("HEAD after delete-while-finalizing = %v, want NoSuchKey", err)
 	}
+}
+
+// TestSinglePutGetDuringFinalizeServesSpool proves a GET that races the
+// background finalize is answered from the spooled body: rclone GETs the
+// object right after upload to verify it, and a 404 here would make it report
+// "object not found" for a write that is about to commit.
+func TestSinglePutGetDuringFinalizeServesSpool(t *testing.T) {
+	ctx := context.Background()
+	b, _, _ := setupMultipartBackend(t)
+
+	finalizeSlots <- struct{}{}
+	finalizeSlots <- struct{}{}
+	defer func() { <-finalizeSlots; <-finalizeSlots }()
+
+	body := "single-put body that must be readable while finalizing"
+	if _, err := b.PutObject(ctx, "mp", "pending/a.bin", map[string]string{"Content-Type": "text/plain"}, strings.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("PutObject: %+v", err)
+	}
+
+	obj, err := b.GetObject(ctx, "mp", "pending/a.bin", nil)
+	if err != nil {
+		t.Fatalf("GET during finalize: %+v", err)
+	}
+	if obj.Size != int64(len(body)) {
+		t.Fatalf("GET size = %d, want %d", obj.Size, len(body))
+	}
+	data, err := io.ReadAll(obj.Contents)
+	_ = obj.Contents.Close()
+	if err != nil {
+		t.Fatalf("read pending body: %+v", err)
+	}
+	if string(data) != body {
+		t.Fatalf("pending body = %q, want %q", data, body)
+	}
+
+	// A ranged GET over the middle of the pending object must match the same
+	// slice of the body, crossing no part boundary here but exercising the
+	// section reader.
+	rr := &gofakes3.ObjectRangeRequest{Start: 7, End: 11}
+	robj, err := b.GetObject(ctx, "mp", "pending/a.bin", rr)
+	if err != nil {
+		t.Fatalf("ranged GET during finalize: %+v", err)
+	}
+	rdata, err := io.ReadAll(robj.Contents)
+	_ = robj.Contents.Close()
+	if err != nil {
+		t.Fatalf("read ranged pending body: %+v", err)
+	}
+	if string(rdata) != body[7:12] {
+		t.Fatalf("ranged pending body = %q, want %q", rdata, body[7:12])
+	}
+}
+
+// TestMultipartGetDuringFinalizeServesParts is the multipart flavour of the
+// above: the concatenated parts, not just the first one, must be served.
+func TestMultipartGetDuringFinalizeServesParts(t *testing.T) {
+	ctx := context.Background()
+	b, _, _ := setupMultipartBackend(t)
+
+	uploadID := mustCreateUpload(t, b, "mp", "pending/mp.bin", nil)
+	e1 := mustUploadPart(t, b, "mp", "pending/mp.bin", uploadID, 1, "Hello, ")
+	e2 := mustUploadPart(t, b, "mp", "pending/mp.bin", uploadID, 2, "multipart ")
+	e3 := mustUploadPart(t, b, "mp", "pending/mp.bin", uploadID, 3, "world!")
+	want := "Hello, multipart world!"
+
+	finalizeSlots <- struct{}{}
+	finalizeSlots <- struct{}{}
+
+	_, _, err := b.CompleteMultipartUpload(ctx, "mp", "pending/mp.bin", uploadID, &gofakes3.CompleteMultipartUploadRequest{
+		Parts: []gofakes3.CompletedPart{
+			{PartNumber: 1, ETag: e1},
+			{PartNumber: 2, ETag: e2},
+			{PartNumber: 3, ETag: e3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload: %+v", err)
+	}
+
+	obj, err := b.GetObject(ctx, "mp", "pending/mp.bin", nil)
+	if err != nil {
+		t.Fatalf("GET during finalize: %+v", err)
+	}
+	data, err := io.ReadAll(obj.Contents)
+	_ = obj.Contents.Close()
+	if err != nil {
+		t.Fatalf("read pending multipart body: %+v", err)
+	}
+	if string(data) != want {
+		t.Fatalf("pending multipart body = %q, want %q", data, want)
+	}
+
+	// Range crossing the 1st/2nd part boundary ("o, mul" spans offsets 4..11).
+	rr := &gofakes3.ObjectRangeRequest{Start: 4, End: 11}
+	robj, err := b.GetObject(ctx, "mp", "pending/mp.bin", rr)
+	if err != nil {
+		t.Fatalf("ranged GET during finalize: %+v", err)
+	}
+	rdata, err := io.ReadAll(robj.Contents)
+	_ = robj.Contents.Close()
+	if err != nil {
+		t.Fatalf("read ranged pending multipart body: %+v", err)
+	}
+	if string(rdata) != want[4:12] {
+		t.Fatalf("ranged pending multipart body = %q, want %q", rdata, want[4:12])
+	}
+
+	<-finalizeSlots
+	<-finalizeSlots
 }

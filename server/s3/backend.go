@@ -203,6 +203,18 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 	bucketPath := bucket.Path
 
 	fp := path.Join(bucketPath, objectName)
+
+	// A write whose finalize is still running in the background must be
+	// readable immediately: clients GET the object right after upload to
+	// verify it (rclone does), and answering 404 during the finalize window
+	// makes them report "object not found" for writes that are about to land.
+	if obj, perr := b.pendingGetObject(bucketName, objectName, rangeRequest); obj != nil || perr != nil {
+		if perr != nil {
+			return nil, perr
+		}
+		return obj, nil
+	}
+
 	fmeta, _ := op.GetNearestMeta(fp)
 	node, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
 	if err != nil {
