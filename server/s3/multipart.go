@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -550,13 +551,11 @@ func (b *s3Backend) sweepRecentFinalized(now time.Time) {
 	})
 }
 
-// pendingHeadObject returns a synthetic object for a bucket/object pair whose
-// multipart completion has been accepted and is still being finalized in the
-// background (completing == true, completedEtag published). The data is not
-// readable yet, but HEAD must report the committed size so uploading clients
-// (rclone verifies size immediately after upload) do not misread the
-// finalize window as a corrupted/missing transfer.
-func (b *s3Backend) pendingHeadObject(bucket, object string) *gofakes3.Object {
+// findCompletingState returns the most recently active upload state whose
+// completion has been accepted (completing, etag published) for the given
+// bucket/object. An overwrite can be finalizing while the older write's state
+// is still around, so the latest lastActivity wins.
+func (b *s3Backend) findCompletingState(bucket, object string) *multipartState {
 	var state *multipartState
 	var bestActivity time.Time
 	b.uploads.Range(func(key, val any) bool {
@@ -565,14 +564,23 @@ func (b *s3Backend) pendingHeadObject(bucket, object string) *gofakes3.Object {
 		match := st.completing && st.completedEtag != "" && st.bucket == bucket && st.object == object
 		activity := st.lastActivity
 		st.mu.Unlock()
-		// An overwrite can be finalizing while the older write's state is
-		// still around: prefer the most recently active one.
 		if match && (state == nil || activity.After(bestActivity)) {
 			state = st
 			bestActivity = activity
 		}
 		return true
 	})
+	return state
+}
+
+// pendingHeadObject returns a synthetic object for a bucket/object pair whose
+// multipart completion has been accepted and is still being finalized in the
+// background (completing == true, completedEtag published). The data is not
+// readable yet, but HEAD must report the committed size so uploading clients
+// (rclone verifies size immediately after upload) do not misread the
+// finalize window as a corrupted/missing transfer.
+func (b *s3Backend) pendingHeadObject(bucket, object string) *gofakes3.Object {
+	state := b.findCompletingState(bucket, object)
 	if state == nil {
 		return nil
 	}
@@ -595,6 +603,149 @@ func (b *s3Backend) pendingHeadObject(bucket, object string) *gofakes3.Object {
 		Metadata: meta,
 		Size:     size,
 		Contents: noOpReadCloser{},
+	}
+}
+
+// partSegment is one part file mapped into the concatenated pending object.
+type partSegment struct {
+	f      *os.File
+	start  int64
+	length int64
+}
+
+// partReaderAt exposes the ordered part files of a completing upload as one
+// contiguous io.ReaderAt, so a pending object can be served byte-identical to
+// what the finalize will commit. Parts are frozen once completing is set
+// (UploadPart rejects completing uploads and the finalizer only removes them
+// after success), so the files stay valid for the reader's lifetime.
+type partReaderAt struct {
+	segs []partSegment
+	size int64
+}
+
+func (p *partReaderAt) ReadAt(buf []byte, off int64) (int, error) {
+	if off < 0 || off >= p.size {
+		return 0, io.EOF
+	}
+	total := 0
+	for total < len(buf) {
+		pos := off + int64(total)
+		seg := &p.segs[len(p.segs)-1]
+		for i := range p.segs {
+			if pos < p.segs[i].start+p.segs[i].length {
+				seg = &p.segs[i]
+				break
+			}
+		}
+		if pos < seg.start || pos >= seg.start+seg.length {
+			return total, io.EOF
+		}
+		max := int(seg.length - (pos - seg.start))
+		if max > len(buf)-total {
+			max = len(buf) - total
+		}
+		n, err := seg.f.ReadAt(buf[total:total+max], pos-seg.start)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func (p *partReaderAt) close() error {
+	var firstErr error
+	for _, s := range p.segs {
+		if err := s.f.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// partReadCloser adapts a SectionReader over partReaderAt into a ReadCloser
+// that closes every part file.
+type partReadCloser struct {
+	*io.SectionReader
+	closer func() error
+}
+
+func (r partReadCloser) Close() error { return r.closer() }
+
+// pendingGetObject serves a GET for an object whose finalize is still running
+// in the background, reading the spooled part files directly. Clients verify
+// uploads by GETting the object right after CompleteMultipartUpload/PutObject
+// (rclone does); without this the finalize window would answer 404 and the
+// client would report "object not found" for a write that is about to land.
+// A nil object (with nil error) means "not pending, fall through to storage".
+func (b *s3Backend) pendingGetObject(bucket, object string, rr *gofakes3.ObjectRangeRequest) (*gofakes3.Object, error) {
+	state := b.findCompletingState(bucket, object)
+	if state == nil {
+		return nil, nil
+	}
+
+	state.mu.Lock()
+	nums := make([]int, 0, len(state.parts))
+	for n := range state.parts {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+	segs := make([]partSegment, 0, len(nums))
+	var size int64
+	for _, n := range nums {
+		p := state.parts[n]
+		f, err := os.Open(p.path)
+		if err != nil {
+			state.mu.Unlock()
+			closeSegments(segs)
+			// The spool vanished (e.g. a give-up raced this read): behave
+			// like the object is not pending and let storage decide.
+			return nil, nil
+		}
+		segs = append(segs, partSegment{f: f, start: size, length: p.size})
+		size += p.size
+	}
+	meta := map[string]string{
+		"Last-Modified": state.lastActivity.UTC().Format(timeFormat),
+	}
+	if ct := state.meta["Content-Type"]; ct != "" {
+		meta["Content-Type"] = ct
+	}
+	state.mu.Unlock()
+
+	var rnge *gofakes3.ObjectRange
+	if rr != nil {
+		var err error
+		rnge, err = rr.Range(size)
+		if err != nil {
+			closeSegments(segs)
+			return nil, err
+		}
+	}
+
+	pra := &partReaderAt{segs: segs, size: size}
+	start, length := int64(0), size
+	if rnge != nil {
+		// ObjectRange is already clamped to the object size by Range().
+		start, length = rnge.Start, rnge.Length
+	}
+	contents := partReadCloser{
+		SectionReader: io.NewSectionReader(pra, start, length),
+		closer:        pra.close,
+	}
+
+	return &gofakes3.Object{
+		Name:     object,
+		Metadata: meta,
+		Size:     size,
+		Range:    rnge,
+		Contents: contents,
+	}, nil
+}
+
+func closeSegments(segs []partSegment) {
+	for _, s := range segs {
+		_ = s.f.Close()
 	}
 }
 
