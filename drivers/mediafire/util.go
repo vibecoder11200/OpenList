@@ -670,7 +670,11 @@ func (d *Mediafire) pollUpload(ctx context.Context, key string) (*MediafirePollR
 		return nil, fmt.Errorf("mediafire: upload key is empty, units did not produce a key")
 	}
 	const (
-		pollTimeout  = 10 * time.Minute
+		// MediaFire assembles multi-unit uploads server-side and can stay on
+		// status 19 ("Assembling File") for well over 10 minutes when the
+		// account or the API is throttled; giving up early loses files whose
+		// units all arrived, so the deadline is generous.
+		pollTimeout  = 30 * time.Minute
 		initialDelay = 2 * time.Second
 		maxDelay     = 5 * time.Second
 	)
