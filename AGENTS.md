@@ -97,3 +97,38 @@ Standard release process:
 6. Verify: `docker exec openlist /opt/openlist/openlist version` reports the new tag, then
    smoke-test the changed features. Keep the previous image tag
    (`openlist-patched:backup-<date>`) for rollback.
+
+## MediaFire Farm Layout (as of 2026-10-12)
+
+Prod = Drive Hub site above (admin API `localhost:5244` on the VPS; local tools
+tunnel it as `localhost:15244`; S3 gateway is `localhost:5246` / tunneled `15246`,
+publicly `https://s3.helloworld.io.vn`). rclone remote name: `drivehub-s3`.
+
+- 442 MediaFire storages mounted (`/mf/mf18` … `/mf/mf529`), DB of accounts and
+  cookies is `D:\mediafire\mediafire_ref.db` (column `liveness` written by
+  `mf_check.py`). Only `liveness='alive'` accounts join aliases.
+- 5 working alias groups, split in ID-order blocks, buckets on the S3 gateway:
+  `mf1→/mf/auto1` (100 acc, mf18–mf129), `mf2→/mf/auto2` (100, mf130–mf233),
+  `mf3→/mf/auto3` (100, mf234–mf338), `mf4→/mf/auto4` (100, mf339–mf496),
+  `mf5→/mf/auto5` (33, mf497–mf529; ~67 free slots for new accounts).
+- `/mf/auto` (bucket `mf`, legacy `mfauto`) is a SPARE: points at one account
+  only, not used for uploads. Do not add accounts to it without asking.
+- Alias policies: read `first`, write `first`, put `quota`. Consequence: a NEW
+  folder must be pre-created (seeded) on many accounts before uploading or all
+  files concentrate on the first healthy account. `Videos/Moi` is already seeded
+  on every alive account; use `mf_seed_folder.py` for other folders (it accepts
+  `--alias /mf/auto2..5` and `all`).
+- Tools (in `D:\mediafire\tools`, run with SSH tunnel up):
+  `mf_check.py` (liveness + camoufox relogin), `mf_update_cookies.py` (push
+  refreshed cookies), `mf_add_to_openlist.py` (mount new accounts, idempotent),
+  `mf_split_aliases.py` (re-balance groups; re-runnable, re-reads DB liveness),
+  `mf_seed_folder.py` (seed a folder across accounts/groups).
+- Never mass-list or mass-scan all 400+ accounts for fun: each alias op fans out
+  N MediaFire calls from one IP; scanning the whole farm from a bad IP gets
+  logins flagged (a changed client IP once "revived" 60+ accounts that were
+  marked dead — verdicts can be IP-poisoned, retry before declaring death).
+- 16 accounts are hard-locked (ids 22–28, 76, 87, 89, 101, 114, 133, 134, 139,
+  142): browser login succeeds but the API keeps rejecting sessions (error 2007)
+  on a clean IP — account-level MediaFire restriction on this oldest
+  temp-mail/referral generation. Fixing them needs manual web-login checks /
+  password resets; they stay outside the aliases.
