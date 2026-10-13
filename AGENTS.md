@@ -109,9 +109,9 @@ publicly `https://s3.helloworld.io.vn`). rclone remote name: `drivehub-s3`.
   `mf_check.py`). Only `liveness='alive'` accounts join aliases.
 - 5 working alias groups, split in ID-order blocks (alive-only, sorted by
   account id), buckets on the S3 gateway:
-  `mf1→/mf/auto1` (100 acc, mf18–mf125), `mf2→/mf/auto2` (100, mf126–mf227),
-  `mf3→/mf/auto3` (100, mf228–mf332), `mf4→/mf/auto4` (100, mf333–mf490),
-  `mf5→/mf/auto5` (39, mf491–mf529; ~61 free slots — append new/revived
+  `mf1→/mf/auto1` (100 acc, mf18–mf124), `mf2→/mf/auto2` (100, mf125–mf224),
+  `mf3→/mf/auto3` (100, mf225–mf329), `mf4→/mf/auto4` (100, mf330–mf473),
+  `mf5→/mf/auto5` (42, mf475–mf529; ~58 free slots — append new/revived
   accounts here; when enough accumulate, re-run a full block split — cheap,
   folders live on the accounts, no reseeding needed).
 - `/mf/auto` (bucket `mf`, legacy `mfauto`) is a SPARE: points at one account
@@ -130,12 +130,13 @@ publicly `https://s3.helloworld.io.vn`). rclone remote name: `drivehub-s3`.
   N MediaFire calls from one IP; scanning the whole farm from a bad IP gets
   logins flagged (a changed client IP once "revived" 60+ accounts that were
   marked dead — verdicts can be IP-poisoned, retry before declaring death).
-- 10 accounts remain hard-locked (ids 22–26, 28, 89, 101, 133, 142): browser
-  login succeeds but the API keeps rejecting sessions (error 2007) across
-  multiple clean-IP rounds — account-level MediaFire restriction on this oldest
-  temp-mail/referral generation. 6 siblings revived after a later retry (27,
-  76, 87, 114, 134, 139 → now in auto5), so re-check these 10 occasionally
-  before writing them off. Fixing them needs manual web-login checks /
-  password resets; they stay outside the aliases.
+- 7 accounts still API-blocked (ids 22–26, 28, 101): browser login succeeds but
+  the API keeps rejecting sessions (error 2007) across multiple clean-IP
+  rounds. But restrictions lift over time — 9 siblings came back after spaced
+  retries (27, 76, 87, 114, 133, 134, 139, 142, 89 → all back in the farm),
+  so re-check these 7 every few days before writing them off. 25 and 28 are
+  also unverified-email (PENDING) — manual web login may show a verification
+  prompt. Fixing needs manual web-login checks / password resets; they stay
+  outside the aliases.
 - After running `mf_add_to_openlist.py`, pass `--alias ''` — without it the
   tool re-syncs `/mf/auto` with ALL mounts and undoes the spare.
